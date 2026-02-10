@@ -1,0 +1,68 @@
+{
+    "apis": [
+      {
+        "name": "get_weather",
+        "description": "Get current weather information for any city worldwide",
+        "tags": ["weather", "temperature", "forecast", "climate"],
+        "keywords": ["weather", "temperature", "forecast", "climate", "rain", "sunny", "cloudy", "hot", "cold"],
+        "api_type": "weather",
+        "endpoint": "https://api.openweathermap.org/data/2.5/weather",
+        "method": "GET",
+        "auth_type": "api_key",
+        "required_params": ["city"],
+        "optional_params": ["country_code", "units"],
+        "param_mapping": {
+          "city": ["location", "city", "place", "where", "in"],
+          "units": ["metric", "imperial", "fahrenheit", "celsius"]
+        },
+        "rate_limit": "60/minute",
+        "cost": "free",
+        "enabled": true
+      },
+      {
+        "name": "get_customer_details",
+        "description": "Retrieves detailed information about a customer.",
+        "tags": ["customer", "details", "info"],
+        "keywords": ["customer details", "customer info", "get customer"],
+        "api_type": "mock",
+        "enabled": false
+      },
+      {
+        "name": "get_product_inventory",
+        "description": "Checks the current stock levels for a specific product.",
+        "tags": ["product", "inventory", "stock"],
+        "keywords": ["product stock", "check inventory", "product availability"],
+        "api_type": "mock",
+        "enabled": false
+      },
+      {
+        "name": "search_cdms_label",
+        "description": "Search for pesticide product labels and safety data sheets from the CDMS database with full citations",
+        "tags": ["pesticide", "label", "cdms", "sds", "safety", "chemical", "herbicide", "insecticide", "fungicide"],
+        "keywords": ["pesticide label", "cdms", "product label", "safety data sheet", "sds", "herbicide label", "insecticide label", "fungicide label", "chemical label", "epa label", "roundup", "sevin", "2,4-d"],
+        "api_type": "tavily_cdms",
+        "required_params": ["product_name"],
+        "optional_params": ["active_ingredient", "max_results"],
+        "param_mapping": {
+          "product_name": ["product", "pesticide", "herbicide", "insecticide", "fungicide", "chemical", "brand", "name"],
+          "active_ingredient": ["active ingredient", "ingredient", "chemical", "compound"]
+        },
+        "enabled": true,
+        "returns_citations": true
+      },
+      {
+        "name": "search_agriculture_web",
+        "description": "Search the web for agriculture and farming information, best practices, and research with citations",
+        "tags": ["agriculture", "farming", "crops", "pest control", "best practices", "research", "information"],
+        "keywords": ["agriculture", "farming", "crops", "pest control", "fertilizer", "soil", "planting", "harvest", "best practices", "how to", "cultivation", "growing", "crop management"],
+        "api_type": "tavily_web",
+        "required_params": ["query"],
+        "optional_params": ["max_results"],
+        "param_mapping": {
+          "query": ["question", "search", "find", "how", "what", "when", "where", "why"]
+        },
+        "enabled": true,
+        "returns_citations": true
+      }
+    ]
+  }

@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+docker_env/
+
+# Vector DB + data
+qdrant_storage/
+data/
+
+# Mac
+.DS_Store
+
+# Logs
+*.log
+
+# Test outputs
+*_chunks*.txt
