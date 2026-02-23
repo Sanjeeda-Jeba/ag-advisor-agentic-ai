@@ -5,6 +5,7 @@ services:
       - "6333:6333"
     volumes:
       - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
 
   app:
     build: .
@@ -17,8 +18,12 @@ services:
       TAVILY_API_KEY: ${TAVILY_API_KEY}
       OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY}
       OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME}
+    volumes:
+      - app_data:/app/data    # SQLite DB + cached PDFs + local Qdrant fallback
     depends_on:
       - qdrant
+    restart: unless-stopped
 
 volumes:
   qdrant_storage:
+  app_data:

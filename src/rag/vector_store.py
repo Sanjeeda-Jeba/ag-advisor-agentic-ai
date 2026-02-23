@@ -3,6 +3,7 @@ Qdrant Vector Store
 Manages vector embeddings in Qdrant database
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
 from typing import List, Dict, Optional
 
 
@@ -21,42 +22,50 @@ class QdrantVectorStore:
     
     Handles storage and retrieval of document embeddings
     
+    Connection priority:
+        1. Remote Qdrant via QDRANT_HOST / QDRANT_PORT env vars (Docker Compose / EC2)
+        2. Remote Qdrant via explicit host/port constructor args
+        3. Persistent local disk storage at data/qdrant_storage/ (local dev fallback)
+    
     Usage:
         store = QdrantVectorStore()
         store.add_document_chunk("chunk_id", embedding, metadata)
         results = store.search_documents(query_embedding)
     """
     
-    def __init__(self, host: str = "localhost", port: int = 6333):
+    def __init__(self, host: str = None, port: int = None):
         """
         Initialize Qdrant client
         
         Args:
-            host: Qdrant host (default: localhost)
-            port: Qdrant port (default: 6333)
+            host: Qdrant host (default: reads QDRANT_HOST env var, then falls back to localhost)
+            port: Qdrant port (default: reads QDRANT_PORT env var, then falls back to 6333)
         """
-        self.host = host
-        self.port = port
+        # Resolve host/port: env vars take priority, then constructor args, then defaults
+        self.host = host or os.environ.get("QDRANT_HOST", "localhost")
+        self.port = int(port or os.environ.get("QDRANT_PORT", "6333"))
         self.embedding_dim = 1536  # OpenAI text-embedding-3-small
         self.using_docker = False
+        self._storage_mode = "unknown"
         
-        # Try to connect to Docker Qdrant first
+        # Try to connect to remote/Docker Qdrant first
         try:
-            self.client = QdrantClient(host=host, port=port, timeout=5)
+            self.client = QdrantClient(host=self.host, port=self.port, timeout=5)
             # Test connection by getting collections
             _ = self.client.get_collections()
             self.using_docker = True
-            print(f"✅ Connected to Qdrant Docker at {host}:{port}")
+            self._storage_mode = "remote"
+            print(f"✅ Connected to Qdrant at {self.host}:{self.port}")
             self.initialize_collections()
         except Exception as e:
-            # If Qdrant not available, use in-memory mode
-            print(f"⚠️  Qdrant Docker not available at {host}:{port}")
-            print(f"   Error: {str(e)}")
-            print(f"   💡 Starting Qdrant: docker run -d -p 6333:6333 qdrant/qdrant")
-            print(f"   📦 Using in-memory mode (data lost on restart)")
-            print(f"   ⚠️  WARNING: In-memory mode creates separate databases per instance!")
-            print(f"   ⚠️  Data stored in one instance won't be visible to another instance.")
-            self.client = QdrantClient(":memory:")
+            # Fall back to persistent local disk storage (NOT in-memory)
+            local_path = str(project_root / "data" / "qdrant_storage")
+            Path(local_path).mkdir(parents=True, exist_ok=True)
+            print(f"⚠️  Qdrant not available at {self.host}:{self.port} ({e})")
+            print(f"   📂 Using persistent local storage: {local_path}")
+            print(f"   💡 For Docker: docker compose up -d qdrant")
+            self.client = QdrantClient(path=local_path)
+            self._storage_mode = "local_disk"
             self.initialize_collections()
     
     def initialize_collections(self):
@@ -134,7 +143,8 @@ class QdrantVectorStore:
         self, 
         query_embedding: List[float], 
         limit: int = 10,
-        score_threshold: float = 0.3  # Lowered from 0.5 to get more results
+        score_threshold: float = 0.3,  # Lowered from 0.5 to get more results
+        product_name: Optional[str] = None
     ) -> List[Dict]:
         """
         Search for similar document chunks
@@ -143,15 +153,29 @@ class QdrantVectorStore:
             query_embedding: Query vector embedding
             limit: Maximum number of results
             score_threshold: Minimum similarity score (0-1)
+            product_name: Optional product name to filter results at the Qdrant level
         
         Returns:
             List of search results with metadata and scores
         """
         try:
+            # Build Qdrant native filter if product_name is provided
+            query_filter = None
+            if product_name:
+                query_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="product_name",
+                            match=MatchValue(value=product_name.lower())
+                        )
+                    ]
+                )
+            
             # Use query_points instead of search (correct Qdrant API)
             response = self.client.query_points(
                 collection_name="cdms_documents",
                 query=query_embedding,  # Changed from query_vector to query
+                query_filter=query_filter,
                 limit=limit,
                 score_threshold=score_threshold,
                 with_payload=True
@@ -187,7 +211,8 @@ class QdrantVectorStore:
         try:
             info = {
                 "using_docker": self.using_docker,
-                "host": self.host if self.using_docker else "in-memory",
+                "storage_mode": self._storage_mode,
+                "host": self.host if self.using_docker else self._storage_mode,
                 "port": self.port if self.using_docker else None
             }
             if self.client.collection_exists("cdms_documents"):

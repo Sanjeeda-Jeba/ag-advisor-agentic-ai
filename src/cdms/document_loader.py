@@ -28,12 +28,14 @@ class DocumentLoader:
         loader.load_all_pdfs()  # Process all PDFs in data/pdfs/
     """
     
-    def __init__(self, pdf_folder: str = "data/pdfs"):
+    def __init__(self, pdf_folder: str = "data/pdfs", vector_store: "QdrantVectorStore | None" = None):
         """
         Initialize document loader
         
         Args:
             pdf_folder: Folder containing PDF files
+            vector_store: Optional shared QdrantVectorStore instance.
+                          If None, a new instance is created.
         """
         self.pdf_folder = Path(pdf_folder)
         self.pdf_folder.mkdir(parents=True, exist_ok=True)
@@ -51,22 +53,25 @@ class DocumentLoader:
             print(f"⚠️  Warning: Could not initialize OpenAI embeddings: {e}")
             self.embedding_service = None
         
-        # Initialize vector store
-        try:
-            self.vector_store = QdrantVectorStore()
-            # Verify vector store is working
-            if hasattr(self.vector_store, 'client'):
-                print(f"✅ Vector store initialized successfully")
-            else:
-                print(f"⚠️  Warning: Vector store initialized but client is missing")
+        # Use shared vector store if provided, otherwise create a new one
+        if vector_store is not None:
+            self.vector_store = vector_store
+            print(f"✅ DocumentLoader: using shared vector store")
+        else:
+            try:
+                self.vector_store = QdrantVectorStore()
+                if hasattr(self.vector_store, 'client'):
+                    print(f"✅ DocumentLoader: vector store initialized")
+                else:
+                    print(f"⚠️  Warning: Vector store initialized but client is missing")
+                    self.vector_store = None
+            except Exception as e:
+                print(f"⚠️  Warning: Could not initialize Qdrant: {e}")
+                import traceback
+                traceback.print_exc()
                 self.vector_store = None
-        except Exception as e:
-            print(f"⚠️  Warning: Could not initialize Qdrant: {e}")
-            import traceback
-            traceback.print_exc()
-            self.vector_store = None
     
-    def load_pdf(self, pdf_path: str, force_reprocess: bool = False, pdf_url: str = None) -> Dict:
+    def load_pdf(self, pdf_path: str, force_reprocess: bool = False, pdf_url: str = None, product_name: str = None) -> Dict:
         """
         Load a single PDF file
         
@@ -74,6 +79,7 @@ class DocumentLoader:
             pdf_path: Path to PDF file
             force_reprocess: If True, reprocess even if already indexed
             pdf_url: Optional original PDF URL (for CDMS labels from Tavily)
+            product_name: Optional product name for Qdrant filtering (e.g., "sevin")
         
         Returns:
             Dict with processing result
@@ -132,114 +138,129 @@ class DocumentLoader:
             if not result.get("success"):
                 return result
             
-            # Store in database
-            doc = Document(
-                id=doc_id,
-                filename=pdf_path.name,
-                filepath=str(pdf_path),
-                file_size=pdf_path.stat().st_size,
-                num_pages=result["num_pages"],
-                num_chunks=result["num_chunks"],
-                processed=1,
-                last_processed=datetime.utcnow()
-            )
-            
-            session.merge(doc)
-            
-            # Store chunks with accurate page numbers
-            chunks_stored = 0
-            embeddings_generated = 0
-            
-            chunks = result.get("chunks", [])
-            page_numbers = result.get("page_numbers", [])
-            
-            # PHASE 2 FIX: Validate page numbers with warnings
-            if not page_numbers:
-                print(f"⚠️  Warning: No page numbers provided for {pdf_path.name}, estimating...")
-                page_numbers = [(idx // 3) + 1 for idx in range(len(chunks))]
-            elif len(page_numbers) != len(chunks):
-                print(f"⚠️  Warning: Page numbers count ({len(page_numbers)}) doesn't match chunks count ({len(chunks)}) for {pdf_path.name}")
-                # Fix by padding or truncating to match
-                if len(page_numbers) < len(chunks):
-                    last_page = page_numbers[-1] if page_numbers else 1
-                    page_numbers.extend([last_page] * (len(chunks) - len(page_numbers)))
+            # Use no_autoflush to prevent premature INSERT/UPDATE during merge
+            with session.no_autoflush:
+                # Check if document already exists by filename (handles duplicate filenames)
+                existing_by_name = session.query(Document).filter_by(filename=pdf_path.name).first()
+                if existing_by_name and existing_by_name.id != doc_id:
+                    # Same filename but different path — update existing record
+                    existing_by_name.filepath = str(pdf_path)
+                    existing_by_name.file_size = pdf_path.stat().st_size
+                    existing_by_name.num_pages = result["num_pages"]
+                    existing_by_name.num_chunks = result["num_chunks"]
+                    existing_by_name.processed = 1
+                    existing_by_name.last_processed = datetime.utcnow()
+                    doc_id = existing_by_name.id  # use the existing doc_id
                 else:
-                    page_numbers = page_numbers[:len(chunks)]
-            
-            for idx, (chunk_text, page_num) in enumerate(zip(chunks, page_numbers)):
-                # PHASE 2 FIX: Validate page number is positive
-                if page_num <= 0:
-                    print(f"⚠️  Warning: Invalid page number {page_num} for chunk {idx} in {pdf_path.name}, using estimated value")
-                    # Estimate page number based on chunk index
-                    page_num = (idx // 3) + 1
-                    page_numbers[idx] = page_num
-                chunk_id = DocumentChunk.generate_id(doc_id, idx)
+                    # Store in database
+                    doc = Document(
+                        id=doc_id,
+                        filename=pdf_path.name,
+                        filepath=str(pdf_path),
+                        file_size=pdf_path.stat().st_size,
+                        num_pages=result["num_pages"],
+                        num_chunks=result["num_chunks"],
+                        processed=1,
+                        last_processed=datetime.utcnow()
+                    )
+                    session.merge(doc)
                 
-                # Calculate token count (rough estimate: 1 token ≈ 4 chars)
-                token_count = len(chunk_text) // 4
+                # Store chunks with accurate page numbers
+                chunks_stored = 0
+                embeddings_generated = 0
                 
-                chunk = DocumentChunk(
-                    id=chunk_id,
-                    document_id=doc_id,
-                    chunk_index=idx,
-                    content=chunk_text,
-                    page_number=page_num,  # ENHANCED: Accurate page number from PDF processor
-                    char_count=len(chunk_text),
-                    token_count=token_count
-                )
+                chunks = result.get("chunks", [])
+                page_numbers = result.get("page_numbers", [])
                 
-                session.merge(chunk)
+                # PHASE 2 FIX: Validate page numbers with warnings
+                if not page_numbers:
+                    print(f"⚠️  Warning: No page numbers provided for {pdf_path.name}, estimating...")
+                    page_numbers = [(idx // 3) + 1 for idx in range(len(chunks))]
+                elif len(page_numbers) != len(chunks):
+                    print(f"⚠️  Warning: Page numbers count ({len(page_numbers)}) doesn't match chunks count ({len(chunks)}) for {pdf_path.name}")
+                    # Fix by padding or truncating to match
+                    if len(page_numbers) < len(chunks):
+                        last_page = page_numbers[-1] if page_numbers else 1
+                        page_numbers.extend([last_page] * (len(chunks) - len(page_numbers)))
+                    else:
+                        page_numbers = page_numbers[:len(chunks)]
                 
-                # Generate embedding and store in Qdrant
-                if self.embedding_service and self.vector_store:
-                    try:
-                        embedding = self.embedding_service.generate_embedding(chunk_text)
-                        
-                        # Validate embedding was generated
-                        if not embedding:
-                            print(f"⚠️  Warning: Failed to generate embedding for chunk {idx} in {pdf_path.name}")
-                        elif len(embedding) != 1536:
-                            print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {idx} in {pdf_path.name}")
-                        else:
-                            # PHASE 1 FIX: Generate URL hash for matching
-                            url_hash = ""
-                            if pdf_url:
-                                import hashlib
-                                url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:12]
+                for idx, (chunk_text, page_num) in enumerate(zip(chunks, page_numbers)):
+                    # PHASE 2 FIX: Validate page number is positive
+                    if page_num <= 0:
+                        print(f"⚠️  Warning: Invalid page number {page_num} for chunk {idx} in {pdf_path.name}, using estimated value")
+                        # Estimate page number based on chunk index
+                        page_num = (idx // 3) + 1
+                        page_numbers[idx] = page_num
+                    chunk_id = DocumentChunk.generate_id(doc_id, idx)
+                    
+                    # Calculate token count (rough estimate: 1 token ≈ 4 chars)
+                    token_count = len(chunk_text) // 4
+                    
+                    chunk = DocumentChunk(
+                        id=chunk_id,
+                        document_id=doc_id,
+                        chunk_index=idx,
+                        content=chunk_text,
+                        page_number=page_num,  # ENHANCED: Accurate page number from PDF processor
+                        char_count=len(chunk_text),
+                        token_count=token_count
+                    )
+                    
+                    session.merge(chunk)
+                    
+                    # Generate embedding and store in Qdrant
+                    if self.embedding_service and self.vector_store:
+                        try:
+                            embedding = self.embedding_service.generate_embedding(chunk_text)
                             
-                            metadata = {
-                                "document_id": doc_id,
-                                "document_name": pdf_path.name,
-                                "chunk_index": idx,
-                                "content": chunk_text,  # Store full content for search
-                                "page_number": page_num,  # ENHANCED: Accurate page number
-                                "source_file": pdf_path.name,
-                                "pdf_url": pdf_url if pdf_url else "",  # PHASE 1 FIX: Store PDF URL in metadata
-                                "url_hash": url_hash  # PHASE 1 FIX: Store URL hash for reliable matching
-                            }
-                            
-                            success = self.vector_store.add_document_chunk(
-                                chunk_id=chunk_id,
-                                embedding=embedding,
-                                metadata=metadata
-                            )
-                            if success:
-                                embeddings_generated += 1
+                            # Validate embedding was generated
+                            if not embedding:
+                                print(f"⚠️  Warning: Failed to generate embedding for chunk {idx} in {pdf_path.name}")
+                            elif len(embedding) != 1536:
+                                print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {idx} in {pdf_path.name}")
                             else:
-                                print(f"⚠️  Warning: Failed to store chunk {idx} in Qdrant for {pdf_path.name}")
-                    except Exception as e:
-                        print(f"⚠️  Warning: Could not generate embedding for chunk {idx}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    # Log why embeddings aren't being generated
-                    if not self.embedding_service:
-                        print(f"⚠️  Warning: Embedding service not available, skipping embeddings for chunk {idx}")
-                    if not self.vector_store:
-                        print(f"⚠️  Warning: Vector store not available, skipping embeddings for chunk {idx}")
-                
-                chunks_stored += 1
+                                # PHASE 1 FIX: Generate URL hash for matching
+                                url_hash = ""
+                                if pdf_url:
+                                    import hashlib
+                                    url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:12]
+                                
+                                metadata = {
+                                    "document_id": doc_id,
+                                    "document_name": pdf_path.name,
+                                    "chunk_index": idx,
+                                    "content": chunk_text,  # Store full content for search
+                                    "page_number": page_num,  # ENHANCED: Accurate page number
+                                    "source_file": pdf_path.name,
+                                    "pdf_url": pdf_url if pdf_url else "",  # PHASE 1 FIX: Store PDF URL in metadata
+                                    "url_hash": url_hash,  # PHASE 1 FIX: Store URL hash for reliable matching
+                                    "product_name": (product_name or "").lower()  # For Qdrant native filtering
+                                }
+                                
+                                success = self.vector_store.add_document_chunk(
+                                    chunk_id=chunk_id,
+                                    embedding=embedding,
+                                    metadata=metadata
+                                )
+                                if success:
+                                    embeddings_generated += 1
+                                else:
+                                    print(f"⚠️  Warning: Failed to store chunk {idx} in Qdrant for {pdf_path.name}")
+                        except Exception as e:
+                            print(f"⚠️  Warning: Could not generate embedding for chunk {idx}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        # Log why embeddings aren't being generated
+                        if not self.embedding_service:
+                            print(f"⚠️  Warning: Embedding service not available, skipping embeddings for chunk {idx}")
+                        if not self.vector_store:
+                            print(f"⚠️  Warning: Vector store not available, skipping embeddings for chunk {idx}")
+                    
+                    chunks_stored += 1
             
+            # Commit outside no_autoflush — now all merges happen in one batch
             session.commit()
             
             # Log summary
@@ -254,6 +275,15 @@ class DocumentLoader:
                 "chunks_stored": chunks_stored,
                 "embeddings_generated": embeddings_generated,
                 "num_pages": result["num_pages"]
+            }
+        
+        except Exception as e:
+            session.rollback()
+            print(f"   ❌ Database error processing {pdf_path.name}: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "filename": pdf_path.name
             }
         
         finally:

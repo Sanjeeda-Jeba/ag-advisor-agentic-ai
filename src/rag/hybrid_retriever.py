@@ -29,13 +29,22 @@ class HybridRetriever:
         results = retriever.retrieve("How do I use the weather API?", top_k=5)
     """
     
-    def __init__(self):
-        """Initialize hybrid retriever"""
-        # Initialize components
-        try:
-            self.vector_store = QdrantVectorStore()
-        except Exception:
-            self.vector_store = None
+    def __init__(self, vector_store: "QdrantVectorStore | None" = None):
+        """
+        Initialize hybrid retriever
+        
+        Args:
+            vector_store: Optional shared QdrantVectorStore instance.
+                          If None, a new instance is created.
+        """
+        # Use shared vector store if provided, otherwise create a new one
+        if vector_store is not None:
+            self.vector_store = vector_store
+        else:
+            try:
+                self.vector_store = QdrantVectorStore()
+            except Exception:
+                self.vector_store = None
         
         try:
             creds = CredentialsManager()

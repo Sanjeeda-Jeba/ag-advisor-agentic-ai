@@ -280,6 +280,19 @@ Generate the response:"""
         total_chunks = data.get('total_chunks_found', 0)
         tavily_labels = data.get('tavily_labels', [])
         
+        # Detect if the user is asking specifically about REI / re-entry interval
+        question_lower = (user_question or "").lower()
+        rei_keywords = ["rei", "re-entry", "reentry", "re entry", "restricted entry interval"]
+        is_rei_question = any(kw in question_lower for kw in rei_keywords)
+        
+        # Detect if any chunk explicitly mentions REI / re-entry
+        has_rei_evidence = False
+        for chunk in rag_chunks:
+            content_lower = (chunk.get("content", "") or "").lower()
+            if any(kw in content_lower for kw in rei_keywords):
+                has_rei_evidence = True
+                break
+        
         # Create mapping of URLs to titles for better citations
         url_to_title = {}
         for label in tavily_labels:
@@ -421,7 +434,13 @@ User asked: "{user_question}"
 
 Product: {product_name}
 
-I searched the official CDMS label database and found {total_chunks} relevant excerpt(s) from the pesticide labels.
+Label Source: {data.get('label_source', 'CDMS')}
+Sources Searched: {', '.join(data.get('sources_tried', ['CDMS']))}
+
+I searched official pesticide label databases and found {total_chunks} relevant excerpt(s) from the labels.
+
+REI_QUESTION: {"YES" if is_rei_question else "NO"}
+REI_TEXT_FOUND_IN_EXCERPTS: {"YES" if has_rei_evidence else "NO"}
 
 Relevant excerpts with page citations:
 
@@ -465,7 +484,7 @@ CRITICAL INSTRUCTIONS - READ CAREFULLY:
 REMINDER: Page numbers are NOT optional. Every citation must include a page number. If you fail to include page numbers, your response is incomplete.
 """
         
-        system_prompt = """You are an expert agriculture assistant specializing in pesticide labels with access to exact excerpts from official CDMS labels.
+        system_prompt = """You are an expert agriculture assistant specializing in pesticide labels with access to exact excerpts from official pesticide label databases (CDMS, Greenbook, EPA, and state databases).
 
 MANDATORY REQUIREMENTS - PAGE NUMBERS ARE REQUIRED:
 
@@ -498,6 +517,13 @@ MANDATORY REQUIREMENTS - PAGE NUMBERS ARE REQUIRED:
 
 8. CRITICAL: You MUST include ALL PDF download links provided in the "Available PDF Downloads" section at the end of your response in a "📄 PDF Downloads" section
 
+9. REI / RE-ENTRY INTERVAL QUESTIONS:
+   - If REI_QUESTION is YES but REI_TEXT_FOUND_IN_EXCERPTS is NO:
+     * You MUST NOT guess or invent any REI value (hours/days) for the product.
+     * Clearly state that the exact REI is not present in the provided excerpts.
+     * Direct the user to consult the linked labels and specify that REI is usually found in the "Directions for Use", "Restrictions", or "Agricultural Use Requirements" section.
+   - If REI_TEXT_FOUND_IN_EXCERPTS is YES, you may summarize the REI but ONLY using explicit text from the excerpts, with page numbers and PDF titles.
+
 Format your response like this:
 
 "[Direct answer to the user's question, using information from the excerpts. Be specific and cite page numbers with PDF titles. 
@@ -529,7 +555,7 @@ Example:
 - [Roundup QuikPRO Label](https://www.cdms.net/ldat/mp50B003.pdf)
 - [Roundup Custom Safety Data Sheet](https://www.cdms.net/ldat/mp34B003.pdf)
 
-All information is from the official CDMS label database. Be conversational, helpful, and emphasize accuracy and safety. 
+All information is from official pesticide label databases (CDMS, Greenbook, EPA, or state DBs). Be conversational, helpful, and emphasize accuracy and safety. 
 IMPORTANT: Always end your response with the "📄 PDF Downloads" section containing ALL the PDF URLs provided in the context."
 """
         
@@ -554,6 +580,11 @@ IMPORTANT: Always end your response with the "📄 PDF Downloads" section contai
         summary = data.get('summary', '')
         labels = data.get('labels', [])
         
+        # Detect if the user is asking specifically about REI / re-entry interval
+        question_lower = (user_question or "").lower()
+        rei_keywords = ["rei", "re-entry", "reentry", "re entry", "restricted entry interval"]
+        is_rei_question = any(kw in question_lower for kw in rei_keywords)
+        
         # Build context with citation emphasis
         label_list = []
         for i, label in enumerate(labels, 1):
@@ -566,52 +597,67 @@ IMPORTANT: Always end your response with the "📄 PDF Downloads" section contai
         
         labels_text = "\n".join(label_list) if label_list else "No labels found"
         
+        label_source = data.get('label_source', 'CDMS')
+        sources_tried = data.get('sources_tried', ['CDMS'])
+        
         context = f"""
 User asked: "{user_question}"
 
-CDMS Label Search Results:
+Pesticide Label Search Results:
 Product: {product_name}
 {f'Active Ingredient: {ingredient}' if ingredient else ''}
+Label Source: {label_source}
+Sources Searched: {', '.join(sources_tried)}
 
-Tavily AI Summary:
+AI Summary:
 {summary}
 
 Found {len(labels)} label(s):
 {labels_text}
 
+REI_QUESTION: {"YES" if is_rei_question else "NO"}
+
 IMPORTANT: 
 1. Answer the user's question based on the summary and labels
 2. Provide direct PDF download links
 3. Be clear about what information is available
+4. Mention which database the labels came from (e.g. CDMS, Greenbook, EPA)
 """
         
         system_prompt = """You are an expert agriculture assistant specializing in pesticide information and safety.
 
-Your response MUST be comprehensive and include:
-1. Brief introduction about the product
-2. Key safety information from the AI summary
-3. All available labels with clear download links
-4. Helpful context about using the labels
+CRITICAL RULES — DO NOT VIOLATE:
+1. ONLY use information from the provided summary and labels. DO NOT invent, guess, or fabricate product descriptions, active ingredients, or safety info.
+2. If 0 labels were found, say so clearly. Do NOT make up product information.
+3. If labels were found, list them with download links. Only describe the product using text from the AI summary — do NOT add your own knowledge.
 
-Format your response like this:
+REI / RE-ENTRY INTERVAL QUESTIONS:
+- If REI_QUESTION is YES and the summary/label snippets do NOT explicitly state an REI or re-entry interval:
+  * You MUST NOT guess or invent any REI value.
+  * Clearly say that the REI is not visible in the provided snippets.
+  * Recommend downloading the label PDFs and checking the "Agricultural Use Requirements" or "Restrictions" section.
+- Only mention specific REI values if they are clearly present in the Tavily summary or label snippets.
 
-"I found [X] label(s) for **[Product Name]** from the CDMS database.
+FORMAT when labels are found:
 
-**About this Product:**
-[Provide a clear summary of what the product is, its uses, and key safety info from the AI summary. Be specific and practical.]
+"I found [X] label(s) for **[Product Name]** from [Source Database Name].
 
 **Available Labels:**
 1. **[Label Name]**
    📄 Download: [URL]
-   
+
 2. **[Label Name]**
    📄 Download: [URL]
 
-**💡 Tip:** These labels contain important safety information, application rates, and usage instructions. Always read the full label before use.
+**💡 Tip:** These labels contain important safety information, application rates, and usage instructions. Always read the full label before use."
 
-All labels are from the official CDMS database."
+FORMAT when NO labels are found:
 
-Be conversational, helpful, and emphasize safety. Use the information provided to give farmers actionable guidance."
+"I could not find any labels for **[Product Name]** across the pesticide label databases I searched ([list sources searched]). This product may be listed under a different name.
+
+💡 Try searching with the active ingredient name or an alternative brand name."
+
+Be conversational, helpful, and emphasize safety. Only state facts from the provided data."
 """
         
         response = self.client.chat.completions.create(

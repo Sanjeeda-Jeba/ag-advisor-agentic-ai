@@ -22,7 +22,7 @@ from src.tools.tool_executor import ToolExecutor
 # ============================================================================
 
 st.set_page_config(
-    page_title="AI Assistant",
+    page_title="AgAdvisor",
     page_icon="🤖",
     layout="centered",
     initial_sidebar_state="collapsed"
@@ -46,56 +46,7 @@ st.markdown("""
         color: #666;
         margin-bottom: 2rem;
     }
-    .user-message {
-        background-color: #E3F2FD;
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-        border-left: 4px solid #1E88E5;
-    }
-    .assistant-message {
-        background-color: #F5F5F5;
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-        border-left: 4px solid #4CAF50;
-    }
-    .tool-badge {
-        display: inline-block;
-        background-color: #4CAF50;
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 0.85rem;
-        margin: 5px 5px 5px 0;
-    }
-    .keyword-badge {
-        display: inline-block;
-        background-color: #FF9800;
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 0.85rem;
-        margin: 5px 5px 5px 0;
-    }
-    .confidence-badge {
-        display: inline-block;
-        background-color: #2196F3;
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 0.85rem;
-        margin: 5px 5px 5px 0;
-    }
-    .citation-badge {
-        display: inline-block;
-        background-color: #9C27B0;
-        color: white;
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-size: 0.85rem;
-        margin: 5px 5px 5px 0;
-    }
+    
     /* Colorful chat input */
     .stChatInput {
         border: 2px solid #1E88E5 !important;
@@ -105,6 +56,25 @@ st.markdown("""
     .stChatInput:focus-within {
         border: 2px solid #4CAF50 !important;
         box-shadow: 0 0 10px rgba(76, 175, 80, 0.3) !important;
+    }
+    
+    /* Borderless, muted processing details toggle */
+    .proc-details summary {
+        font-size: 0.78rem;
+        color: #999;
+        cursor: pointer;
+        list-style: none;
+        margin-bottom: 4px;
+    }
+    .proc-details summary::-webkit-details-marker { display: none; }
+    .proc-details summary::before { content: "▸ "; }
+    .proc-details[open] summary::before { content: "▾ "; }
+    .proc-details .proc-log {
+        font-size: 0.75rem;
+        color: #999;
+        line-height: 1.6;
+        margin: 0 0 8px 6px;
+        padding: 0;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -149,7 +119,7 @@ if 'tool_executor' not in st.session_state:
 col_title, col_new_chat = st.columns([4, 1])
 
 with col_title:
-    st.markdown('<div class="main-title">🤖 Agriculture AI Assistant</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">🌱 AgAdvisor</div>', unsafe_allow_html=True)
 
 with col_new_chat:
     if st.button("➕ New Chat", type="primary", use_container_width=True):
@@ -244,49 +214,29 @@ with chat_container:
         # Display messages in chronological order (oldest to newest, like ChatGPT)
         for idx, message in enumerate(messages):
             if message["role"] == "user":
-                st.markdown(f"""
-                    <div class="user-message">
-                        <strong>👤 You:</strong><br>
-                        {message["content"]}
-                    </div>
-                """, unsafe_allow_html=True)
+                with st.chat_message("user"):
+                    st.markdown(message["content"])
             
             else:  # assistant
-                st.markdown(f"""
-                    <div class="assistant-message">
-                        <strong>🤖 AgAdvisor:</strong><br>
-                        {message["content"]}
-                    </div>
-                """, unsafe_allow_html=True)
-                
-                # Show metadata badges
-                metadata = message.get("metadata", {})
-                if metadata:
-                    badges_html = f"""
-                        <div style="margin-top: 10px;">
-                            <span class="tool-badge">🔧 {metadata.get('tool', 'Unknown')}</span>
-                            <span class="confidence-badge">📊 {metadata.get('confidence', 0):.0%} confidence</span>
-                    """
+                with st.chat_message("assistant"):
+                    # Processing details — muted toggle ABOVE the response
+                    metadata = message.get("metadata", {})
+                    proc_log = metadata.get("processing_log", []) if metadata else []
+                    if proc_log:
+                        # Strip markdown bold (**) for the HTML view
+                        log_html = "<br>".join(
+                            line.replace("**", "") for line in proc_log
+                        )
+                        st.markdown(
+                            f'<details class="proc-details">'
+                            f'<summary>Processing details</summary>'
+                            f'<div class="proc-log">{log_html}</div>'
+                            f'</details>',
+                            unsafe_allow_html=True
+                        )
                     
-                    keywords = metadata.get('keywords', [])
-                    if keywords:
-                        keywords_text = ", ".join(keywords[:3])
-                        badges_html += f'<span class="keyword-badge">🔑 {keywords_text}</span>'
-                    
-                    # Check for citations
-                    raw_data = metadata.get('raw_data', {})
-                    if raw_data and 'citations' in raw_data and raw_data.get('citations'):
-                        badge_text = "📚 Citations Included"
-                        if 'labels' in raw_data:
-                            count = len(raw_data.get('labels', []))
-                            badge_text = f"📚 {count} Source(s)"
-                        elif 'sources' in raw_data:
-                            count = len(raw_data.get('sources', []))
-                            badge_text = f"📚 {count} Source(s)"
-                        badges_html += f'<span class="citation-badge">{badge_text}</span>'
-                    
-                    badges_html += "</div>"
-                    st.markdown(badges_html, unsafe_allow_html=True)
+                    # Main response
+                    st.markdown(message["content"])
 
 # ============================================================================
 # INPUT SECTION (AT BOTTOM, LIKE CHATGPT)
@@ -343,38 +293,40 @@ if has_new_input or pending_processing_key:
     # Get the question to process (from session state)
     question_to_process = st.session_state.get(processing_key, user_input if has_new_input else "")
     
-    # Processing with detailed status (like before)
+    # Processing — show a simple spinner; collect detailed log for the
+    # dropdown that persists in the chat history after processing.
+    processing_log = []   # collects lines for the post-response expander
     try:
-        with st.status("🤔 Processing your question...", expanded=True) as status:
+        with st.spinner("Processing your question..."):
             # Step 1: Parse and extract keywords
-            st.write("**Step 1:** 🔍 Analyzing your question...")
+            processing_log.append("**Step 1:** 🔍 Analyzing your question...")
             try:
                 parsed = parse_query(question_to_process)
                 keywords = parsed.get("extracted_keywords", [])
-                st.write(f"   ✅ Keywords: {', '.join(keywords[:5])}")
+                processing_log.append(f"   ✅ Keywords: {', '.join(keywords[:5])}")
             except Exception as e:
-                st.write(f"   ⚠️ Using direct matching")
+                processing_log.append(f"   ⚠️ Using direct matching")
                 keywords = []
             
-            # Step 2: Get conversation history for context (needed for tool matching)
-            st.write("**Step 2:** 🔄 Checking conversation context...")
+            # Step 2: Get conversation history for context
+            processing_log.append("**Step 2:** 🔄 Checking conversation context...")
             conversation_context = []
-            if len(current_chat['messages']) > 1:  # Has previous messages
-                recent_messages = current_chat['messages'][-6:-1]  # Last 5 before current
+            if len(current_chat['messages']) > 1:
+                recent_messages = current_chat['messages'][-6:-1]
                 for msg in recent_messages:
                     conversation_context.append({
                         "role": msg["role"],
                         "content": msg["content"]
                     })
-                st.write(f"   ✅ Using context from {len(conversation_context)} previous messages")
+                processing_log.append(f"   ✅ Using context from {len(conversation_context)} previous messages")
             else:
-                st.write(f"   ℹ️ No previous context")
+                processing_log.append(f"   ℹ️ No previous context")
             
-            # Step 3: Match with tools (with context)
-            st.write("**Step 3:** 🎯 Selecting best tool...")
+            # Step 3: Match with tools
+            processing_log.append("**Step 3:** 🎯 Selecting best tool...")
             try:
                 tool_match = st.session_state.tool_matcher.match_tool(
-                    keywords, 
+                    keywords,
                     question_to_process,
                     conversation_context=conversation_context
                 )
@@ -383,64 +335,57 @@ if has_new_input or pending_processing_key:
                 method = tool_match.get("method", "unknown")
                 llm_used = tool_match.get("llm_used", False)
                 
-                # Display method used
                 if method == "fast_path":
-                    st.write(f"   ⚡ Fast path (keyword matching)")
-                elif method == "llm_path" or method == "llm_cached":
-                    st.write(f"   🧠 LLM classification ({'cached' if method == 'llm_cached' else 'live'})")
+                    processing_log.append(f"   ⚡ Fast path (keyword matching)")
+                elif method in ("llm_path", "llm_cached"):
+                    processing_log.append(f"   🧠 LLM classification ({'cached' if method == 'llm_cached' else 'live'})")
                 elif method == "hybrid":
-                    st.write(f"   🔀 Hybrid (fast + LLM)")
+                    processing_log.append(f"   🔀 Hybrid (fast + LLM)")
                 else:
-                    st.write(f"   ⚙️ {method}")
+                    processing_log.append(f"   ⚙️ {method}")
                 
-                st.write(f"   ✅ Selected: **{selected_tool}** ({confidence:.0%} confidence)")
+                processing_log.append(f"   ✅ Selected: **{selected_tool}** ({confidence:.0%} confidence)")
                 
-                # Show LLM reasoning if available
                 if llm_used and tool_match.get("llm_reasoning"):
-                    st.write(f"   💭 Reasoning: {tool_match['llm_reasoning'][:100]}...")
+                    processing_log.append(f"   💭 Reasoning: {tool_match['llm_reasoning'][:100]}...")
             except Exception as e:
-                st.write(f"   ⚠️ Using default tool")
-                selected_tool = "cdms_label"  # Default fallback (CDMS is now the RAG tool)
+                processing_log.append(f"   ⚠️ Using default tool")
+                selected_tool = "cdms_label"
                 confidence = 0.3
                 method = "fallback"
             
-            # Step 4: Execute tool (with conversation context)
-            st.write(f"**Step 4:** ⚙️ Executing **{selected_tool}** tool...")
+            # Step 4: Execute tool
+            processing_log.append(f"**Step 4:** ⚙️ Executing **{selected_tool}** tool...")
             try:
                 tool_result = st.session_state.tool_executor.execute(
                     tool_name=selected_tool,
                     user_question=question_to_process,
-                    conversation_context=conversation_context  # Pass context for follow-ups
+                    conversation_context=conversation_context
                 )
                 
-                # Check if execution was successful
                 if not tool_result.get("success", False):
                     error_msg = tool_result.get("error", "Unknown error")
                     tool_result["llm_response"] = f"I encountered an error: {error_msg}"
-                    st.write(f"   ❌ Error: {error_msg}")
+                    processing_log.append(f"   ❌ Error: {error_msg}")
                 else:
-                    # Check if fallback was used
                     if tool_result.get("fallback_used"):
-                        st.write(f"   ⚠️ CDMS found no results, using agriculture web search as fallback")
+                        processing_log.append(f"   ⚠️ CDMS found no results, using agriculture web search as fallback")
                     else:
-                        st.write(f"   ✅ Tool executed successfully!")
+                        processing_log.append(f"   ✅ Tool executed successfully!")
                         
-                        # Show PDF download info for CDMS tool
                         if selected_tool in ["cdms_label", "cdms", "pesticide_label"]:
                             raw_data = tool_result.get("raw_data", {})
                             pdfs_downloaded = raw_data.get("pdfs_downloaded", 0)
                             pdfs_indexed = raw_data.get("pdfs_indexed", 0)
                             if pdfs_downloaded > 0:
-                                st.write(f"   📥 Downloaded {pdfs_downloaded} PDF(s) from CDMS")
+                                processing_log.append(f"   📥 Downloaded {pdfs_downloaded} PDF(s)")
                                 if pdfs_indexed > 0:
-                                    st.write(f"   📚 Indexed {pdfs_indexed} PDF(s) for RAG search")
+                                    processing_log.append(f"   📚 Indexed {pdfs_indexed} PDF(s) for RAG search")
                                 download_info = raw_data.get("download_info", {})
                                 downloaded_pdfs = download_info.get("downloaded_pdfs", [])
-                                if downloaded_pdfs:
-                                    st.write(f"   📄 PDFs:")
-                                    for pdf in downloaded_pdfs[:3]:  # Show first 3
-                                        cached = "cached" if pdf.get("cached") else "new"
-                                        st.write(f"      - {pdf.get('filename', 'Unknown')} ({cached})")
+                                for pdf in downloaded_pdfs[:3]:
+                                    cached = "cached" if pdf.get("cached") else "new"
+                                    processing_log.append(f"   📄 {pdf.get('filename', 'Unknown')} ({cached})")
                 
             except Exception as e:
                 tool_result = {
@@ -448,9 +393,7 @@ if has_new_input or pending_processing_key:
                     "error": str(e),
                     "llm_response": f"I encountered an error while processing your request: {str(e)}"
                 }
-                st.write(f"   ❌ Execution error: {str(e)}")
-            
-            status.update(label="✅ Complete!", state="complete", expanded=False)
+                processing_log.append(f"   ❌ Execution error: {str(e)}")
         
         # Add assistant response to current chat
         response_text = tool_result.get("llm_response", "I couldn't process that request. Please try again.")
@@ -460,8 +403,8 @@ if has_new_input or pending_processing_key:
             "content": response_text,
             "timestamp": time.time(),
             "metadata": {
-                "tool": tool_result.get("tool_used", selected_tool),  # Use actual tool used (may be fallback)
-                "original_tool": selected_tool,  # Keep original selection
+                "tool": tool_result.get("tool_used", selected_tool),
+                "original_tool": selected_tool,
                 "fallback_used": tool_result.get("fallback_used", False),
                 "keywords": keywords,
                 "confidence": confidence,
@@ -469,7 +412,8 @@ if has_new_input or pending_processing_key:
                 "success": tool_result.get("success", False),
                 "error": tool_result.get("error") if not tool_result.get("success") else None,
                 "has_context": len(conversation_context) > 0,
-                "context_messages": len(conversation_context)
+                "context_messages": len(conversation_context),
+                "processing_log": processing_log  # saved for the dropdown
             }
         })
         
@@ -590,9 +534,8 @@ with st.sidebar:
 
 st.markdown("---")
 st.markdown("""
-    <div style="text-align: center; color: #666; font-size: 0.9rem;">
-        Powered by LangGraph, spaCy, OpenAI, Qdrant, and Tavily | 
-        CDMS Labels • USDA Soil Data • Real-time Weather • Web Search with Citations
+    <div style="text-align: center; color: #999; font-size: 0.8rem;">
+        AgAdvisor can make mistakes. Always verify important information with official sources before making decisions.
     </div>
 """, unsafe_allow_html=True)
 

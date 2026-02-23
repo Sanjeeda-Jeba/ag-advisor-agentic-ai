@@ -72,7 +72,23 @@ class DatabaseManager:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
         self.db_path = db_path
-        self.engine = create_engine(f"sqlite:///{db_path}")
+        # SQLite concurrency fixes:
+        #   - timeout=30: wait up to 30s for locks instead of default 5s
+        #   - check_same_thread=False: allow cross-thread access (safe with scoped sessions)
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 30, "check_same_thread": False},
+            pool_pre_ping=True,
+        )
+        
+        # Enable WAL mode for better concurrent read/write performance
+        from sqlalchemy import event
+        @event.listens_for(self.engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+            cursor.close()
         
         # Create tables
         Base.metadata.create_all(self.engine)

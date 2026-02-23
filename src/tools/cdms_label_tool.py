@@ -15,7 +15,7 @@ from src.api_clients.tavily_client import TavilyAPIClient
 from src.cdms.pdf_downloader import CDMSPDFDownloader
 from src.cdms.rag_search import CDMSRAGSearch
 from src.cdms.document_loader import DocumentLoader
-from pathlib import Path
+from src.rag.vector_store import QdrantVectorStore
 
 
 class CDMSLabelTool:
@@ -23,15 +23,28 @@ class CDMSLabelTool:
     Tool for searching CDMS pesticide labels
     
     Uses Tavily with domain filtering (cdms.net) to find accurate label information
-    with full citations and source URLs
+    with full citations and source URLs.
+    
+    Creates a single shared QdrantVectorStore and passes it to both
+    DocumentLoader (writes) and CDMSRAGSearch (reads) so they always
+    see the same data — even on in-memory or local-disk fallback.
     """
     
     def __init__(self):
-        """Initialize the CDMS label search tool"""
+        """Initialize the CDMS label search tool with a shared vector store"""
         self.client = TavilyAPIClient()
         self.pdf_downloader = CDMSPDFDownloader()
-        self.rag_search = CDMSRAGSearch()
-        self.document_loader = DocumentLoader(pdf_folder="data/pdfs/cdms")
+        
+        # Create ONE shared QdrantVectorStore for all components
+        self._shared_vector_store = QdrantVectorStore()
+        
+        # Pass the shared instance to both readers and writers
+        self.rag_search = CDMSRAGSearch(vector_store=self._shared_vector_store)
+        self.document_loader = DocumentLoader(
+            pdf_folder="data/pdfs/cdms",
+            vector_store=self._shared_vector_store,
+        )
+        
         self.tool_name = "cdms_label_search"
         self.description = "Search for pesticide product labels and safety data sheets from the CDMS database"
     
@@ -104,7 +117,10 @@ class CDMSLabelTool:
             "citations": citations,
             "query_used": raw_results.get("query", ""),
             "search_metadata": raw_results.get("search_metadata", {}),
-            "raw_tavily_results": raw_results  # Keep for PDF extraction
+            "raw_tavily_results": raw_results,  # Keep for PDF extraction
+            # Pass through multi-source metadata from Tavily client
+            "source": raw_results.get("source", "unknown"),
+            "sources_tried": raw_results.get("sources_tried", []),
         }
     
     def _format_citations(self, labels: list) -> str:
@@ -261,9 +277,9 @@ class CDMSLabelTool:
             True if PDF is indexed in both DB and Qdrant, False otherwise
         """
         try:
-            from src.cdms.schema import Document, DatabaseManager
-            db_manager = DatabaseManager()
-            session = db_manager.get_session()
+            from src.cdms.schema import Document
+            # Reuse the document_loader's db_manager to avoid competing SQLite connections
+            session = self.document_loader.db_manager.get_session()
             
             try:
                 pdf_path_obj = Path(pdf_path)
@@ -277,8 +293,6 @@ class CDMSLabelTool:
                         try:
                             if self.rag_search.vector_store.client.collection_exists("cdms_documents"):
                                 # Check if there are any chunks for this document
-                                # We can't easily filter by document_id in Qdrant without searching,
-                                # so we'll just check if collection has any points
                                 collection_info = self.rag_search.vector_store.client.get_collection("cdms_documents")
                                 if collection_info.points_count > 0:
                                     return True
@@ -325,8 +339,8 @@ class CDMSLabelTool:
                 - pdfs_indexed: int
                 - total_chunks_found: int
         """
-        # Step 1: Tavily search for PDF URLs
-        print(f"🔍 Step 1: Searching Tavily for '{product_name}' PDFs...")
+        # Step 1: Search for label PDFs across multiple databases (CDMS → Greenbook → EPA → …)
+        print(f"🔍 Step 1: Searching label databases for '{product_name}' (fallback chain)...")
         tavily_result = self.search(
             product_name=product_name,
             active_ingredient=active_ingredient,
@@ -334,8 +348,8 @@ class CDMSLabelTool:
         )
         
         if not tavily_result.get("success"):
-            error_msg = tavily_result.get("error", "Tavily search failed")
-            print(f"❌ Tavily search failed: {error_msg}")
+            error_msg = tavily_result.get("error", "Label search failed")
+            print(f"❌ Label search failed: {error_msg}")
             return {
                 "success": False,
                 "error": error_msg,
@@ -343,7 +357,11 @@ class CDMSLabelTool:
             }
         
         labels_found = tavily_result.get("label_count", 0)
-        print(f"✅ Tavily search successful: Found {labels_found} label(s)")
+        search_source = tavily_result.get("source", "unknown")
+        sources_tried = tavily_result.get("sources_tried", [])
+        print(f"✅ Label search successful: Found {labels_found} label(s) via {search_source}")
+        if len(sources_tried) > 1:
+            print(f"   Sources tried: {' → '.join(sources_tried)}")
         
         # Step 2: Download PDFs
         print(f"📥 Step 2: Downloading PDFs for '{product_name}'...")
@@ -378,7 +396,8 @@ class CDMSLabelTool:
                     index_result = self.document_loader.load_pdf(
                         pdf_path, 
                         force_reprocess=False,
-                        pdf_url=pdf_url  # PHASE 1 FIX: Pass PDF URL to store in metadata
+                        pdf_url=pdf_url,  # PHASE 1 FIX: Pass PDF URL to store in metadata
+                        product_name=product_name  # For Qdrant native filtering
                     )
                     if index_result.get("success"):
                         chunks = index_result.get("chunks_stored", 0)
@@ -538,11 +557,77 @@ class CDMSLabelTool:
             "pdfs_downloaded": len(downloaded_pdfs),
             "pdfs_indexed": pdfs_indexed,
             "total_chunks_found": len(rag_chunks),
+            # Ensure Tavily-only response path has the fields it expects when rag_chunks is empty
+            "summary": tavily_result.get("summary", ""),
+            "labels": tavily_result.get("labels", []),
+            "citations": tavily_result.get("citations", ""),
             "tavily_results": tavily_result,
             "download_info": download_result,
             "pdf_urls": list(filename_to_url.values()),  # All PDF URLs
-            "tavily_labels": tavily_labels  # Include Tavily labels with URLs
+            "tavily_labels": tavily_labels,  # Include Tavily labels with URLs
+            # Multi-source metadata
+            "label_source": tavily_result.get("source", "CDMS"),
+            "sources_tried": tavily_result.get("sources_tried", ["CDMS"]),
         }
+
+
+# ── Shared constants for product extraction ──────────────────────────
+# All pesticide category/type words — used to identify the boundary
+# between a product name and its category suffix.
+CATEGORY_WORDS = {
+    "pesticide", "herbicide", "insecticide", "fungicide",
+    "termiticide", "acaricide", "nematicide", "rodenticide",
+    "molluscicide", "miticide", "bactericide", "algicide",
+    "larvicide", "fumigant", "repellent", "desiccant",
+}
+
+# Words that should NEVER be part of a product name.
+_EXTRACTION_NOISE = (
+    {"the", "a", "an", "find", "get", "show", "search", "for", "of",
+     "what", "what's", "whats", "how", "is", "are", "tell", "me",
+     "about", "rei", "re-entry", "reentry", "restricted", "entry",
+     "interval", "rate", "application", "safety", "mixing",
+     "instructions", "information", "data", "sheet", "from", "cdms",
+     "label", "labels", "sds"}
+    | CATEGORY_WORDS  # category words are boundaries, not product names
+)
+
+
+def _extract_product_words_before(words: list, anchor_idx: int, max_words: int = 4) -> str:
+    """
+    Walk backwards from *anchor_idx* in *words*, collecting product-name
+    tokens until we hit a noise/category word or reach *max_words*.
+    Returns the joined product name or empty string.
+    """
+    parts = []
+    for i in range(anchor_idx - 1, -1, -1):
+        w = words[i]
+        if w in _EXTRACTION_NOISE:
+            break
+        parts.insert(0, w)
+        if len(parts) >= max_words:
+            break
+    return " ".join(parts)
+
+
+def _extract_product_words_after(words: list, anchor_idx: int, max_words: int = 4) -> str:
+    """
+    Walk forwards from the word AFTER *anchor_idx*, collecting product-name
+    tokens until we hit a noise/category word or reach *max_words*.
+    Skips minor noise words like 'the', 'a'.
+    Returns the joined product name or empty string.
+    """
+    skip = {"the", "a", "an", "this", "that"}
+    parts = []
+    for w in words[anchor_idx + 1:]:
+        if w in skip:
+            continue
+        if w in _EXTRACTION_NOISE:
+            break
+        parts.append(w)
+        if len(parts) >= max_words:
+            break
+    return " ".join(parts)
 
 
 def execute_cdms_label_tool(question: str, conversation_context: list = None) -> Dict:
@@ -567,129 +652,132 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
         }
     """
     try:
-        # Simple parameter extraction
-        # TODO: Could use NLP to better extract product names and ingredients
-        # For now, we'll pass the whole question and let Tavily handle it
+        import re
         
-        # Try to extract product name (simple approach)
-        # Common keywords to look for
-        keywords = ["roundup", "sevin", "2,4-d", "glyphosate", "carbaryl", "atrazine"]
+        # ── Clean question ──────────────────────────────────────────────
+        question_clean = re.sub(r'[®™©]', '', question).strip()
+        question_lower = question_clean.lower()
+        words = question_lower.split()
         
         product_name = None
         active_ingredient = None
+        # Track whether the product was extracted from the *current* question
+        # (vs. conversation context). This prevents follow-up logic from
+        # overwriting a product the user explicitly named.
+        product_from_current_question = False
         
-        question_lower = question.lower()
+        # Well-known products (fast path — NOT the only path)
+        KNOWN_PRODUCTS = [
+            "roundup", "sevin", "2,4-d", "glyphosate", "carbaryl", "atrazine",
+            "machete", "megalodon", "crossbow", "prowl", "gramoxone", "paraquat",
+            "dicamba", "liberty", "enlist", "laudis", "callisto", "acuron",
+            "warrant", "dual magnum", "metolachlor", "trifluralin",
+        ]
         
-        # Check for common product names in current question
-        for keyword in keywords:
+        # ── Step 1: Check known products in current question (fast path) ─
+        for keyword in KNOWN_PRODUCTS:
             if keyword in question_lower:
                 product_name = keyword
+                product_from_current_question = True
                 break
         
-        # If no product found in current question, check conversation context
+        # ── Step 2: Flexible extraction from the *current* question ──────
+        #    This runs even if Step 1 found nothing, BEFORE conversation
+        #    context, so a new product in the question always wins.
+        if not product_name:
+            # Pattern A: "label for X …" / "X … label"
+            if "label" in words:
+                label_idx = words.index("label")
+                # "label for X …" → take words AFTER "label for"
+                if label_idx + 1 < len(words) and words[label_idx + 1] == "for":
+                    potential = _extract_product_words_after(words, label_idx + 1)
+                    if potential:
+                        product_name = potential
+                        product_from_current_question = True
+                # "X … label" → take words BEFORE "label"
+                if not product_name and label_idx > 0:
+                    potential = _extract_product_words_before(words, label_idx)
+                    if potential:
+                        product_name = potential
+                        product_from_current_question = True
+            
+            # Pattern B: "X herbicide/insecticide/termiticide/…"
+            #             Uses the shared CATEGORY_WORDS set so ANY
+            #             pesticide-type suffix is handled generically.
+            if not product_name:
+                for term in CATEGORY_WORDS:
+                    if term in words:
+                        term_idx = words.index(term)
+                        if term_idx > 0:
+                            potential = _extract_product_words_before(words, term_idx)
+                            if potential:
+                                product_name = potential
+                                product_from_current_question = True
+                                break
+            
+            # Pattern C: "rei for/of X", "what is X", "tell me about X"
+            #             Uses _extract_product_words_after so all noise &
+            #             category words are automatically filtered.
+            if not product_name:
+                for prep in ["for", "of", "about"]:
+                    if prep in words:
+                        prep_idx = words.index(prep)
+                        potential = _extract_product_words_after(words, prep_idx)
+                        if potential:
+                            product_name = potential
+                            product_from_current_question = True
+                            break
+        
+        # ── Step 3: Broad extraction — filter out all known noise, take remainder
+        is_pesticide_related = any(
+            kw in question_lower for kw in (
+                CATEGORY_WORDS | {
+                    "label", "application rate", "safety", "mixing",
+                    "chemical", "cdms", "rei", "re-entry", "reentry",
+                    "spray", "concentrate", "formulation", "active ingredient",
+                    "epa", "sds", "msds",
+                }
+            )
+        )
+        
+        if not product_name and is_pesticide_related:
+            filtered = [w for w in question_clean.split()
+                        if w.lower() not in _EXTRACTION_NOISE]
+            if filtered:
+                product_name = " ".join(filtered[:4])
+                product_from_current_question = True
+        
+        # ── Step 4: Conversation context (LAST resort) ──────────────────
+        #    Only used when the current question contains NO product at all
+        #    (e.g. bare follow-ups like "what about safety?").
         if not product_name and conversation_context:
-            # Look for product name in previous messages
-            for msg in reversed(conversation_context):  # Start from most recent
+            for msg in reversed(conversation_context):
                 content = msg.get("content", "").lower()
-                for keyword in keywords:
+                for keyword in KNOWN_PRODUCTS:
                     if keyword in content:
                         product_name = keyword
                         break
                 if product_name:
                     break
         
-        # If still no product found, try to extract from phrases like "label for X" or "X label"
-        if not product_name:
-            if "label for" in question_lower:
-                parts = question_lower.split("label for")
-                if len(parts) > 1:
-                    product_name = parts[1].strip().split()[0] if parts[1].strip() else None
-            elif "label" in question_lower:
-                parts = question_lower.split("label")
-                if parts[0].strip():
-                    words = parts[0].strip().split()
-                    if words:
-                        product_name = words[-1]
-        
-        # If no product found, check if this is a pesticide-related question
-        # If it is, we'll try CDMS anyway (might find something), otherwise it will fallback
-        is_pesticide_related = any(
-            kw in question_lower for kw in [
-                "pesticide", "herbicide", "insecticide", "fungicide", "label",
-                "application rate", "safety", "mixing", "chemical", "cdms"
-            ]
-        )
-        
-        # PHASE 2 FIX: Be more flexible - if tool matcher selected CDMS, trust it and try to search
-        # Extract any potential product name from the question itself
-        if not product_name:
-            # Try to extract product name from common patterns
-            # Pattern: "X label", "label for X", "X pesticide", etc.
-            words = question_lower.split()
-            
-            # Look for word before "label"
-            if "label" in words:
-                label_idx = words.index("label")
-                if label_idx > 0:
-                    # Take words before "label" as potential product name (could be multiple words)
-                    # Example: "Actagro 10% Boron label" -> "Actagro 10% Boron"
-                    potential_product_parts = []
-                    for i in range(label_idx - 1, -1, -1):  # Go backwards from label
-                        word = words[i]
-                        if word in ["the", "a", "an", "find", "get", "show", "search", "for", "of"]:
-                            break
-                        potential_product_parts.insert(0, word)
-                        if len(potential_product_parts) >= 4:  # Limit to 4 words max
-                            break
-                    if potential_product_parts:
-                        product_name = " ".join(potential_product_parts)
-            
-            # Look for word before "pesticide", "herbicide", etc.
-            if not product_name:
-                for term in ["pesticide", "herbicide", "insecticide", "fungicide"]:
-                    if term in words:
-                        term_idx = words.index(term)
-                        if term_idx > 0:
-                            # Take words before the term
-                            potential_product_parts = []
-                            for i in range(term_idx - 1, -1, -1):
-                                word = words[i]
-                                if word in ["the", "a", "an", "find", "get", "show", "search", "for", "of"]:
-                                    break
-                                potential_product_parts.insert(0, word)
-                                if len(potential_product_parts) >= 4:
-                                    break
-                            if potential_product_parts:
-                                product_name = " ".join(potential_product_parts)
-                                break
-        
-        # If still no product but pesticide-related, try with the question itself or generic term
+        # ── Step 5: Final fallback ─────────────────────────────────────
         if not product_name:
             if is_pesticide_related:
-                # Use first few words of question as product name, or generic "pesticide"
-                # This allows CDMS to search even without specific product name
-                # IMPROVED: Handle multi-word product names like "Actagro 10% Boron"
-                words = question.split()  # Use original case to preserve special chars like "10%"
-                # Filter out common question words
-                filtered_words = [w for w in words if w.lower() not in ["what", "how", "tell", "me", "about", "find", "get", "show", "search", "for", "the", "a", "an", "label", "pesticide", "herbicide"]]
-                if filtered_words:
-                    # Take up to 4 words for product name (handles "Actagro 10% Boron")
-                    product_name = " ".join(filtered_words[:4])
-                else:
-                    product_name = "pesticide"  # Generic fallback
+                product_name = "pesticide"
             else:
-                # Not pesticide-related and no product - return error (will trigger fallback)
                 return {
                     "success": False,
                     "tool": "cdms_label",
-                    "error": "Could not identify the pesticide product name. Please specify a product (e.g., 'Find Roundup label')",
-                    "should_fallback": True  # Flag for fallback
+                    "error": "Could not identify the pesticide product name. "
+                             "Please specify a product (e.g., 'Find Roundup label')",
+                    "should_fallback": True
                 }
         
-        # Create tool and run full RAG pipeline
-        tool = CDMSLabelTool()
+        print(f"🏷️  Extracted product_name = '{product_name}' "
+              f"(from {'question' if product_from_current_question else 'context'})")
         
-        # Enhance question with context if this is a follow-up
+        # ── Create tool and prepare enhanced question ───────────────────
+        tool = CDMSLabelTool()
         enhanced_question = question
         
         # Detect follow-up question types
@@ -708,54 +796,38 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
                 detected_type = ftype
                 break
         
-        # If this looks like a follow-up question, enhance with context
-        is_followup = (
-            conversation_context and (
-                # No product name in current question but has context
-                (not product_name or product_name == "pesticide") or
-                # Question is vague/short
-                len(question.split()) <= 5 or
-                # Detected follow-up type
-                detected_type is not None or
-                # Common follow-up phrases
-                any(phrase in question_lower for phrase in [
-                    "what about", "how about", "tell me more", "and", "also", "what's the"
-                ])
-            )
-        )
-        
-        if is_followup:
-            # Find the most recent mention of the product in context
+        # Follow-up enhancement — ONLY override product_name when the
+        # current question truly has no product (context-only extraction).
+        if conversation_context and not product_from_current_question:
+            # This is a genuine follow-up (no product in current question).
             context_product = None
             for msg in reversed(conversation_context):
                 msg_content = msg.get("content", "").lower()
-                # Check for product names in previous messages
-                for keyword in keywords:
+                for keyword in KNOWN_PRODUCTS:
                     if keyword in msg_content:
                         context_product = keyword
                         break
                 if context_product:
                     break
-            
-            # If we found a product in context, use it
             if context_product and (not product_name or product_name == "pesticide"):
                 product_name = context_product
-            
-            # Enhance question with product context and follow-up type
-            if product_name and product_name != "pesticide":
-                if detected_type:
-                    # Add specific context based on follow-up type
-                    enhanced_question = f"{question} for {product_name} {detected_type}"
-                else:
-                    enhanced_question = f"{question} about {product_name}"
-            elif detected_type:
-                # Add follow-up type context
-                enhanced_question = f"{question} {detected_type}"
+        
+        # Build enhanced question (append product + type for better RAG recall)
+        if product_name and product_name != "pesticide":
+            if detected_type:
+                enhanced_question = f"{question} for {product_name} {detected_type}"
+            # Only append "about product" if product isn't already in the question
+            elif product_name.lower() not in question_lower:
+                enhanced_question = f"{question} about {product_name}"
+        elif detected_type:
+            enhanced_question = f"{question} {detected_type}"
+        
+        print(f"📝 Enhanced question: {enhanced_question}")
         
         # Use full RAG pipeline: Tavily → Download → Process → Index → RAG Search
         result = tool.search_with_rag(
             product_name=product_name,
-            user_question=enhanced_question,  # Pass enhanced question for RAG search
+            user_question=enhanced_question,
             active_ingredient=active_ingredient
         )
         

@@ -29,14 +29,24 @@ class CDMSRAGSearch:
         results = searcher.search("What's the application rate for Roundup?", product_name="Roundup")
     """
     
-    def __init__(self):
-        """Initialize RAG search components"""
-        # Initialize vector store
-        try:
-            self.vector_store = QdrantVectorStore()
-        except Exception as e:
-            print(f"⚠️  Warning: Could not initialize Qdrant: {e}")
-            self.vector_store = None
+    def __init__(self, vector_store: "QdrantVectorStore | None" = None):
+        """
+        Initialize RAG search components
+        
+        Args:
+            vector_store: Optional shared QdrantVectorStore instance.
+                          If None, a new instance is created.
+        """
+        # Use shared vector store if provided, otherwise create a new one
+        if vector_store is not None:
+            self.vector_store = vector_store
+            print(f"✅ CDMSRAGSearch: using shared vector store")
+        else:
+            try:
+                self.vector_store = QdrantVectorStore()
+            except Exception as e:
+                print(f"⚠️  Warning: Could not initialize Qdrant: {e}")
+                self.vector_store = None
         
         # Initialize embedding service
         try:
@@ -85,50 +95,81 @@ class CDMSRAGSearch:
                 print("⚠️  Warning: Failed to generate query embedding")
                 return []
             
-            # Search Qdrant (we'll filter by product_name after search)
-            # Get more results if filtering by product to ensure we have enough
-            search_limit = limit * 3 if product_name else limit  # Increased multiplier for better filtering
-            
-            # Lower score threshold if we're filtering by product to get more candidates
-            effective_threshold = score_threshold * 0.8 if product_name else score_threshold
-            
+            # ── Primary search: product-scoped via Qdrant native filter ──
+            # product_name is passed to Qdrant so only that product's chunks
+            # are considered — no cross-product contamination.
             results = self.vector_store.search_documents(
                 query_embedding=query_embedding,
-                limit=search_limit,
-                score_threshold=effective_threshold
+                limit=limit,
+                score_threshold=score_threshold,
+                product_name=product_name  # Qdrant-level filter
             )
             
-            print(f"   🔍 Found {len(results)} candidate(s) before product filter")
+            print(f"   🔍 Found {len(results)} result(s) for product '{product_name or 'all'}'")
             
-            # Filter by product name if specified (post-filter)
-            if product_name:
-                filtered_results = []
+            # If native filter returned nothing, fall back to unfiltered search
+            # (handles legacy chunks indexed without product_name field)
+            if len(results) == 0 and product_name:
+                print(f"   ⚠️  No results with native filter — trying unfiltered search + post-filter")
+                unfiltered = self.vector_store.search_documents(
+                    query_embedding=query_embedding,
+                    limit=limit * 3,
+                    score_threshold=score_threshold * 0.8
+                )
                 product_lower = product_name.lower()
-                for result in results:
-                    # Check source_file or document_name for product match
-                    source_file = result.get("source_file", "").lower()
-                    document_name = result.get("metadata", {}).get("document_name", "").lower()
-                    content = result.get("content", "").lower()
-                    
-                    # Enhanced matching: check if product name appears in filename, document name, or content
-                    if (product_lower in source_file or 
-                        product_lower in document_name or 
-                        product_lower in content[:200]):  # Check first 200 chars of content
-                        filtered_results.append(result)
-                
-                print(f"   🔍 After product filter ('{product_name}'): {len(filtered_results)} result(s)")
-                
-                # If filtering removed all results, fall back to unfiltered results
-                # This handles cases where product name extraction was incorrect
-                if len(filtered_results) == 0 and len(results) > 0:
-                    print(f"   ⚠️  Product filter removed all results. Using unfiltered results instead.")
-                    results = results[:limit]
-                else:
-                    # Limit to requested number
-                    results = filtered_results[:limit]
-            else:
-                # Limit to requested number
+                for r in unfiltered:
+                    source = r.get("source_file", "").lower()
+                    doc_name = r.get("metadata", {}).get("document_name", "").lower()
+                    content = r.get("content", "").lower()
+                    if (product_lower in source or
+                        product_lower in doc_name or
+                        product_lower in content[:500]):
+                        results.append(r)
                 results = results[:limit]
+                print(f"   🔍 Post-filter fallback: {len(results)} result(s)")
+            
+            # ── REI keyword boost (product-scoped) ──
+            rei_keywords = ["rei", "re-entry", "reentry", "restricted entry"]
+            query_lower = query.lower()
+            if any(kw in query_lower for kw in rei_keywords):
+                has_rei = any(
+                    any(kw in r.get("content", "").lower() for kw in rei_keywords)
+                    for r in results
+                )
+                if not has_rei and self.vector_store and self.embedding_service:
+                    rei_query = f"{product_name or ''} re-entry interval restricted entry agricultural use requirements"
+                    rei_embedding = self.embedding_service.generate_embedding(rei_query)
+                    if rei_embedding:
+                        # Search with product filter so only this product's REI is returned
+                        rei_results = self.vector_store.search_documents(
+                            query_embedding=rei_embedding,
+                            limit=10,
+                            score_threshold=0.2,
+                            product_name=product_name
+                        )
+                        rei_hits = [
+                            r for r in rei_results
+                            if any(kw in r.get("content", "").lower() for kw in rei_keywords)
+                        ]
+                        
+                        if rei_hits:
+                            # Put REI chunks FIRST, then fill remaining slots
+                            seen_ids = set()
+                            merged = []
+                            for r in rei_hits:
+                                rid = r.get("id")
+                                if rid not in seen_ids:
+                                    seen_ids.add(rid)
+                                    merged.append(r)
+                            for r in results:
+                                rid = r.get("id")
+                                if rid not in seen_ids:
+                                    seen_ids.add(rid)
+                                    merged.append(r)
+                            results = merged[:limit]
+                            print(f"   🔍 REI boost: {len(rei_hits)} REI chunk(s) for '{product_name}' prioritized, {len(results)} total")
+                        else:
+                            print(f"   ⚠️  REI boost: no REI chunks found for '{product_name}'")
             
             # Format results with page numbers and PDF URLs
             formatted_results = []

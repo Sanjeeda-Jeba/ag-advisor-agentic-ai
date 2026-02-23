@@ -29,7 +29,7 @@ class PDFProcessor:
         chunks = result["chunks"]
     """
     
-    def __init__(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+    def __init__(self, chunk_size: int = 2000, chunk_overlap: int = 300):
         """
         Initialize PDF processor
         

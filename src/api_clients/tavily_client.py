@@ -174,6 +174,25 @@ class TavilyAPIClient(BaseAPIClient):
                 "result_count": 0
             }
     
+    # ========================================================================
+    # LABEL SEARCH DOMAIN CONFIGURATION
+    # ========================================================================
+    
+    # Fallback chain: search these domain groups in order until relevant results are found.
+    # Each entry is (label_for_logging, list_of_domains).
+    LABEL_DOMAIN_CHAIN = [
+        ("CDMS",       ["cdms.net"]),
+        ("Greenbook",  ["greenbook.net"]),
+        ("EPA",        ["epa.gov"]),
+        ("CDPR / State DBs", ["cdpr.ca.gov", "picol.cahnrs.wsu.edu"]),
+        # Last resort: broad web search scoped to pesticide label PDFs
+        ("Web (broad)", None),  # None = no domain filter
+    ]
+    
+    # ========================================================================
+    # PUBLIC API — search_cdms_labels (unchanged signature, new internals)
+    # ========================================================================
+    
     def search_cdms_labels(
         self,
         product_name: str,
@@ -181,8 +200,10 @@ class TavilyAPIClient(BaseAPIClient):
         max_results: int = 5
     ) -> Dict[str, Any]:
         """
-        Search specifically for CDMS pesticide labels
-        Uses domain filtering to ensure results are from cdms.net
+        Search for pesticide labels across multiple databases with a fallback chain.
+        
+        Searches in order: CDMS → Greenbook → EPA → State DBs → broad web.
+        Stops as soon as relevant results are found for the product.
         
         Args:
             product_name: Product/brand name (e.g., "Roundup")
@@ -190,65 +211,162 @@ class TavilyAPIClient(BaseAPIClient):
             max_results: Maximum number of results
         
         Returns:
-            Search results with CDMS-specific formatting and citations
+            Search results with label-specific formatting and citations
         """
-        # Build query - optimize for CDMS search
-        # Tavily doesn't support Google-style operators like "site:" or "filetype:"
-        # Instead, we use domain filtering via include_domains parameter
-        # Build natural language query that works well with Tavily
+        import re
         
-        # Clean product name (remove special characters that might confuse search)
-        # But keep important ones like "%" for products like "Actagro 10% Boron"
+        # Clean product name
         clean_product_name = product_name.strip()
+        clean_product_name = re.sub(r'[®™©]', '', clean_product_name).strip()
         
-        # Build query with CDMS context
+        # Words used for relevance validation
+        product_words = [w.lower() for w in clean_product_name.split() if len(w) > 2]
+        
+        # Track which sources we tried (for transparency)
+        sources_tried = []
+        
+        # Walk the fallback chain
+        for source_label, domains in self.LABEL_DOMAIN_CHAIN:
+            print(f"🔍 Searching {source_label} for '{clean_product_name}'...")
+            sources_tried.append(source_label)
+            
+            # Build query — adapt wording per source
+            query = self._build_label_query(clean_product_name, active_ingredient, source_label)
+            
+            # Execute search
+            raw_results = self.search(
+                query=query,
+                max_results=max_results * 2,  # over-fetch to allow filtering
+                search_depth="advanced",
+                include_domains=domains,  # None means no domain filter
+                include_answer=True,
+                include_raw_content=False
+            )
+            
+            if not raw_results.get("success"):
+                print(f"   ❌ {source_label} search failed: {raw_results.get('error', 'unknown')}")
+                continue
+            
+            # Prioritize PDFs
+            raw_results = self._prioritize_pdfs(raw_results, max_results)
+            
+            # Validate relevance
+            validated = self._validate_relevance(raw_results, product_words, product_name)
+            
+            relevant_count = validated.get("result_count", 0)
+            
+            if relevant_count > 0:
+                print(f"   ✅ {source_label}: Found {relevant_count} relevant label(s)")
+                # Attach metadata and return
+                validated["search_type"] = "pesticide_label"
+                validated["source"] = source_label
+                validated["sources_tried"] = sources_tried
+                validated["product_name"] = product_name
+                validated["active_ingredient"] = active_ingredient
+                return validated
+            else:
+                print(f"   ⚠️  {source_label}: 0 relevant results — trying next source...")
+        
+        # All sources exhausted — return empty result
+        print(f"❌ No relevant labels found for '{product_name}' across all sources: {', '.join(sources_tried)}")
+        return {
+            "success": True,  # search itself succeeded, just no relevant results
+            "query": f"{clean_product_name} pesticide label",
+            "answer": (
+                f"No labels found for '{product_name}' across CDMS, Greenbook, EPA, "
+                f"or state databases. The product may be listed under a different name "
+                f"or may not be registered in these databases."
+            ),
+            "results": [],
+            "result_count": 0,
+            "search_type": "pesticide_label",
+            "source": "none",
+            "sources_tried": sources_tried,
+            "product_name": product_name,
+            "active_ingredient": active_ingredient
+        }
+    
+    # ========================================================================
+    # PRIVATE HELPERS
+    # ========================================================================
+    
+    def _build_label_query(
+        self,
+        clean_product_name: str,
+        active_ingredient: Optional[str],
+        source_label: str
+    ) -> str:
+        """Build the Tavily query string, slightly adapted per source."""
+        parts = [clean_product_name]
         if active_ingredient:
-            # Include both product name and ingredient
-            query = f"{clean_product_name} {active_ingredient} pesticide label CDMS"
+            parts.append(active_ingredient)
+        parts.append("pesticide label")
+        
+        # Add source hint for broad web search so Tavily focuses on labels
+        if source_label == "Web (broad)":
+            parts.append("PDF safety data sheet")
+        
+        return " ".join(parts)
+    
+    def _prioritize_pdfs(self, results: Dict, max_results: int) -> Dict:
+        """Re-order results so PDF links come first, then HTML pages."""
+        if not results.get("success"):
+            return results
+        
+        all_results = results.get("results", [])
+        pdf_results = []
+        html_results = []
+        
+        for result in all_results:
+            url = result.get("url", "")
+            if url.lower().endswith('.pdf') or '/ldat/' in url.lower():
+                pdf_results.append(result)
+            else:
+                html_results.append(result)
+        
+        prioritized = pdf_results[:max_results]
+        if len(prioritized) < max_results:
+            remaining = max_results - len(prioritized)
+            prioritized.extend(html_results[:remaining])
+        
+        results["results"] = prioritized
+        results["result_count"] = len(prioritized)
+        return results
+    
+    def _validate_relevance(
+        self,
+        results: Dict,
+        product_words: List[str],
+        product_name: str
+    ) -> Dict:
+        """Filter results to only those that mention the queried product."""
+        if not results.get("success") or not results.get("results"):
+            return results
+        
+        validated = []
+        rejected = []
+        
+        for result in results.get("results", []):
+            title = result.get("title", "").lower()
+            content = result.get("content", "").lower()
+            url = result.get("url", "").lower()
+            combined = f"{title} {content} {url}"
+            
+            if any(word in combined for word in product_words):
+                validated.append(result)
+            else:
+                rejected.append(result)
+        
+        if rejected:
+            print(f"      Filtered out {len(rejected)} irrelevant result(s) for '{product_name}'")
+        
+        if validated:
+            results["results"] = validated
+            results["result_count"] = len(validated)
         else:
-            # Just product name with CDMS context
-            query = f"{clean_product_name} pesticide label CDMS"
-        
-        # Search with domain filter (this is how Tavily restricts to cdms.net)
-        results = self.search(
-            query=query,
-            max_results=max_results * 2,  # Get more results to filter for PDFs
-            search_depth="advanced",
-            include_domains=["cdms.net"],  # Only CDMS results!
-            include_answer=True,
-            include_raw_content=False  # Can enable if needed
-        )
-        
-        # Filter results to prioritize PDFs
-        if results.get("success"):
-            all_results = results.get("results", [])
-            pdf_results = []
-            html_results = []
-            
-            # Separate PDFs from HTML pages
-            for result in all_results:
-                url = result.get("url", "")
-                if url.lower().endswith('.pdf') or '/ldat/' in url.lower():
-                    pdf_results.append(result)
-                else:
-                    html_results.append(result)
-            
-            # Prioritize PDFs: take PDFs first, then HTML pages if needed
-            prioritized_results = pdf_results[:max_results]
-            if len(prioritized_results) < max_results:
-                # Add HTML pages if we don't have enough PDFs
-                remaining = max_results - len(prioritized_results)
-                prioritized_results.extend(html_results[:remaining])
-            
-            # Update results with prioritized list
-            results["results"] = prioritized_results
-            results["result_count"] = len(prioritized_results)
-        
-        # Add CDMS-specific metadata
-        if results.get("success"):
-            results["search_type"] = "cdms_label"
-            results["product_name"] = product_name
-            results["active_ingredient"] = active_ingredient
+            results["results"] = []
+            results["result_count"] = 0
+            results["answer"] = f"No relevant labels found for '{product_name}' in this source."
         
         return results
     
