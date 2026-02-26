@@ -16,6 +16,7 @@ from src.parser import parse_query
 from src.utils.parameter_extractor import extract_keywords_from_query
 from src.tools.tool_matcher import ToolMatcher
 from src.tools.tool_executor import ToolExecutor
+from src.cdms.schema import DatabaseManager, Feedback
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -76,6 +77,22 @@ st.markdown("""
         margin: 0 0 8px 6px;
         padding: 0;
     }
+
+    /* Pull invisible star buttons up over the colored HTML stars */
+    [data-testid="stChatMessage"] [data-testid="stHorizontalBlock"]
+        [data-testid="stBaseButton-secondary"] {
+        margin-top: -2.2rem !important;
+        height: 1.8rem !important;
+    }
+    [data-testid="stChatMessage"] [data-testid="stHorizontalBlock"]
+        [data-testid="stBaseButton-secondary"] button {
+        opacity: 0 !important;
+        width: 100% !important;
+        height: 1.8rem !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+        cursor: pointer !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -104,6 +121,9 @@ if 'conversation_history' not in st.session_state:
     st.session_state.conversation_history = st.session_state.chats.get(
         st.session_state.current_chat_id, {}
     ).get('messages', [])
+
+if 'feedback_state' not in st.session_state:
+    st.session_state.feedback_state = {}
 
 if 'tool_matcher' not in st.session_state:
     st.session_state.tool_matcher = ToolMatcher()
@@ -223,7 +243,6 @@ with chat_container:
                     metadata = message.get("metadata", {})
                     proc_log = metadata.get("processing_log", []) if metadata else []
                     if proc_log:
-                        # Strip markdown bold (**) for the HTML view
                         log_html = "<br>".join(
                             line.replace("**", "") for line in proc_log
                         )
@@ -237,6 +256,80 @@ with chat_container:
                     
                     # Main response
                     st.markdown(message["content"])
+                    
+                    # --- Feedback UI ---
+                    _STAR_COLORS = ["#e53935", "#fb8c00", "#fdd835", "#c0ca33", "#43a047"]
+                    chat_id = st.session_state.current_chat_id
+                    fb_key = f"{chat_id}_{idx}"
+                    fb_state = st.session_state.feedback_state.get(fb_key)
+                    
+                    if fb_state and fb_state.get("submitted"):
+                        r = fb_state['rating']
+                        c = _STAR_COLORS[r - 1]
+                        filled = "".join(f'<span style="color:{_STAR_COLORS[i]}">★</span>' for i in range(r))
+                        empty = "".join(f'<span style="color:#ddd">☆</span>' for _ in range(5 - r))
+                        st.markdown(
+                            f'<span style="font-size:0.85rem;">{filled}{empty}</span>'
+                            f' <span style="color:#999;font-size:0.78rem;">thanks!</span>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        selected = fb_state.get("rating") if fb_state else None
+                        st.markdown(
+                            '<span style="color:#aaa;font-size:0.78rem;">Rate this response</span>',
+                            unsafe_allow_html=True,
+                        )
+                        cols = st.columns([0.3, 0.3, 0.3, 0.3, 0.3, 6])
+                        for star in range(1, 6):
+                            with cols[star - 1]:
+                                c = _STAR_COLORS[star - 1]
+                                filled = selected is not None and star <= selected
+                                sym = "★" if filled else "☆"
+                                st.markdown(
+                                    f'<span style="color:{c};font-size:1.3rem;'
+                                    f'cursor:pointer;user-select:none;">{sym}</span>',
+                                    unsafe_allow_html=True,
+                                )
+                                st.button("\u200b", key=f"star_{fb_key}_{star}")
+                                if st.session_state.get(f"star_{fb_key}_{star}"):
+                                    st.session_state.feedback_state[fb_key] = {"rating": star, "submitted": False}
+                                    st.rerun()
+                        
+                        if selected and not (fb_state or {}).get("submitted"):
+                            comment = st.text_input(
+                                "Could you briefly explain your rating?",
+                                key=f"comment_{fb_key}",
+                                placeholder="e.g. The answer was helpful but could use more detail...",
+                            )
+                            if st.button("Submit", key=f"submit_{fb_key}"):
+                                if not comment or not comment.strip():
+                                    st.warning("Please share a brief comment before submitting.")
+                                    st.stop()
+                                user_msg = ""
+                                if idx > 0:
+                                    prev = messages[idx - 1]
+                                    if prev["role"] == "user":
+                                        user_msg = prev["content"]
+                                try:
+                                    db = DatabaseManager()
+                                    session = db.get_session()
+                                    session.add(Feedback(
+                                        chat_id=chat_id,
+                                        user_query=user_msg,
+                                        agent_response=message["content"][:2000],
+                                        tool_used=metadata.get("tool", "") if metadata else "",
+                                        rating=selected,
+                                        comment=comment if comment else None,
+                                    ))
+                                    session.commit()
+                                    session.close()
+                                except Exception:
+                                    pass
+                                st.session_state.feedback_state[fb_key] = {
+                                    "rating": selected,
+                                    "submitted": True,
+                                }
+                                st.rerun()
 
 # ============================================================================
 # INPUT SECTION (AT BOTTOM, LIKE CHATGPT)
@@ -511,6 +604,33 @@ with st.sidebar:
                     if st.session_state.current_chat_id == chat_id:
                         st.session_state.current_chat_id = list(st.session_state.chats.keys())[0]
                     st.rerun()
+    
+    st.markdown("---")
+    
+    # Feedback export
+    st.markdown("### 📊 Feedback")
+    try:
+        db = DatabaseManager()
+        session = db.get_session()
+        rows = session.query(Feedback).order_by(Feedback.created_at.desc()).all()
+        session.close()
+        st.caption(f"{len(rows)} response(s) collected")
+        if rows:
+            import io, csv
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["id", "chat_id", "user_query", "agent_response", "tool_used", "rating", "comment", "created_at"])
+            for r in rows:
+                writer.writerow([r.id, r.chat_id, r.user_query, r.agent_response, r.tool_used, r.rating, r.comment, r.created_at])
+            st.download_button(
+                "Download CSV",
+                data=buf.getvalue(),
+                file_name="agadvisor_feedback.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+    except Exception:
+        st.caption("Feedback DB not available")
     
     st.markdown("---")
     

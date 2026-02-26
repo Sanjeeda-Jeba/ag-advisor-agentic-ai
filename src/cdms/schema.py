@@ -58,6 +58,20 @@ class DocumentChunk(Base):
         return f"{document_id}_{chunk_index}"
 
 
+class Feedback(Base):
+    """User feedback on assistant responses"""
+    __tablename__ = 'feedback'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(String)
+    user_query = Column(Text)
+    agent_response = Column(Text)
+    tool_used = Column(String)
+    rating = Column(Integer)
+    comment = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class DatabaseManager:
     """Manages the CDMS database"""
     
