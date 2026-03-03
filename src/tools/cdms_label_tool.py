@@ -384,42 +384,44 @@ class CDMSLabelTool:
         
         downloaded_pdfs = download_result.get("downloaded_pdfs", [])
         
-        # Step 3: Process and index PDFs (if not already indexed)
-        pdfs_indexed = 0
+        # Step 3: Process and index PDFs in parallel (if not already indexed)
+        # SQLite is configured with WAL mode + check_same_thread=False, and each
+        # load_pdf call creates its own session, so concurrent indexing is safe.
         print(f"📚 Indexing {len(downloaded_pdfs)} downloaded PDF(s)...")
-        for pdf_info in downloaded_pdfs:
+
+        def _index_one(pdf_info):
             pdf_path = pdf_info["filepath"]
-            pdf_url = pdf_info.get("url", "")  # PHASE 1 FIX: Get URL from download info
-            
-            # Check if already indexed
-            is_indexed = self._is_pdf_indexed(pdf_path)
-            if is_indexed:
+            pdf_url = pdf_info.get("url", "")
+            if self._is_pdf_indexed(pdf_path):
                 print(f"   ⏭️  {Path(pdf_path).name}: Already indexed (skipping)")
-            else:
-                # Process and index with PDF URL
-                print(f"   📄 Indexing: {Path(pdf_path).name}...")
-                try:
-                    index_result = self.document_loader.load_pdf(
-                        pdf_path, 
-                        force_reprocess=False,
-                        pdf_url=pdf_url,  # PHASE 1 FIX: Pass PDF URL to store in metadata
-                        product_name=product_name  # For Qdrant native filtering
-                    )
-                    if index_result.get("success"):
-                        chunks = index_result.get("chunks_stored", 0)
-                        embeddings = index_result.get("embeddings_generated", 0)
-                        if index_result.get("skipped"):
-                            print(f"   ⏭️  {Path(pdf_path).name}: Already processed (skipped)")
-                        else:
-                            print(f"   ✅ {Path(pdf_path).name}: {chunks} chunks, {embeddings} embeddings")
-                            pdfs_indexed += 1
-                    else:
-                        error = index_result.get("error", "Unknown error")
-                        print(f"   ❌ Failed to index {Path(pdf_path).name}: {error}")
-                except Exception as e:
-                    print(f"   ❌ Error indexing {Path(pdf_path).name}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                return 0
+            print(f"   📄 Indexing: {Path(pdf_path).name}...")
+            try:
+                index_result = self.document_loader.load_pdf(
+                    pdf_path,
+                    force_reprocess=False,
+                    pdf_url=pdf_url,
+                    product_name=product_name
+                )
+                if index_result.get("success"):
+                    if index_result.get("skipped"):
+                        print(f"   ⏭️  {Path(pdf_path).name}: Already processed (skipped)")
+                        return 0
+                    chunks = index_result.get("chunks_stored", 0)
+                    embeddings = index_result.get("embeddings_generated", 0)
+                    print(f"   ✅ {Path(pdf_path).name}: {chunks} chunks, {embeddings} embeddings")
+                    return 1
+                else:
+                    print(f"   ❌ Failed to index {Path(pdf_path).name}: {index_result.get('error', 'Unknown error')}")
+                    return 0
+            except Exception as e:
+                print(f"   ❌ Error indexing {Path(pdf_path).name}: {e}")
+                import traceback
+                traceback.print_exc()
+                return 0
+
+        with ThreadPoolExecutor(max_workers=len(downloaded_pdfs) or 1) as executor:
+            pdfs_indexed = sum(executor.map(_index_one, downloaded_pdfs))
         
         # Step 4: Verify Qdrant has chunks before searching
         qdrant_chunks_count = 0
