@@ -272,31 +272,6 @@ class CDMSLabelTool:
             "errors": errors if errors else None
         }
     
-    def _product_is_indexed(self, product_name: str) -> bool:
-        """
-        Return True if Qdrant already has at least one chunk for this product.
-        Uses a lightweight scroll (no embedding needed) so it's very fast.
-        """
-        if not self.rag_search.vector_store:
-            return False
-        try:
-            from qdrant_client.models import Filter, FieldCondition, MatchValue
-            points, _ = self.rag_search.vector_store.client.scroll(
-                collection_name="cdms_documents",
-                scroll_filter=Filter(
-                    must=[FieldCondition(
-                        key="product_name",
-                        match=MatchValue(value=product_name.lower())
-                    )]
-                ),
-                limit=1,
-                with_payload=False,
-                with_vectors=False,
-            )
-            return len(points) > 0
-        except Exception:
-            return False
-
     def _is_pdf_indexed(self, pdf_path: str) -> bool:
         """
         Check if PDF is already indexed in both database AND Qdrant
@@ -370,39 +345,6 @@ class CDMSLabelTool:
                 - pdfs_indexed: int
                 - total_chunks_found: int
         """
-        # Fast path: if this product is already indexed in Qdrant, skip the entire
-        # Tavily → download → index pipeline and jump straight to RAG search.
-        # The chunks already carry pdf_url in their metadata so citations still work.
-        if self._product_is_indexed(product_name):
-            print(f"✅ '{product_name}' already in Qdrant — skipping Tavily/download/index")
-            rag_chunks = self.rag_search.search(
-                query=user_question,
-                product_name=product_name,
-                limit=5,
-                score_threshold=0.3,
-            )
-            print(f"   Found {len(rag_chunks)} chunk(s) from cached index")
-            # Recover PDF URLs stored in Qdrant chunk metadata so the LLM
-            # response generator can build proper download links.
-            pdf_urls = list({c["pdf_url"] for c in rag_chunks if c.get("pdf_url")})
-            return {
-                "success": True,
-                "product_name": product_name,
-                "rag_chunks": rag_chunks,
-                "pdfs_downloaded": 0,
-                "pdfs_indexed": 0,
-                "total_chunks_found": len(rag_chunks),
-                "summary": "",
-                "labels": [],
-                "citations": "",
-                "tavily_results": {},
-                "download_info": {},
-                "pdf_urls": pdf_urls,
-                "tavily_labels": [],
-                "label_source": "cache",
-                "sources_tried": ["cache"],
-            }
-
         # Step 1: Search for label PDFs across multiple databases (CDMS → Greenbook → EPA → …)
         print(f"🔍 Step 1: Searching label databases for '{product_name}' (fallback chain)...")
         tavily_result = self.search(
