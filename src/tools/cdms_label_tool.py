@@ -382,6 +382,9 @@ class CDMSLabelTool:
                 score_threshold=0.3,
             )
             print(f"   Found {len(rag_chunks)} chunk(s) from cached index")
+            # Recover PDF URLs stored in Qdrant chunk metadata so the LLM
+            # response generator can build proper download links.
+            pdf_urls = list({c["pdf_url"] for c in rag_chunks if c.get("pdf_url")})
             return {
                 "success": True,
                 "product_name": product_name,
@@ -394,7 +397,7 @@ class CDMSLabelTool:
                 "citations": "",
                 "tavily_results": {},
                 "download_info": {},
-                "pdf_urls": [],
+                "pdf_urls": pdf_urls,
                 "tavily_labels": [],
                 "label_source": "cache",
                 "sources_tried": ["cache"],
@@ -511,9 +514,7 @@ class CDMSLabelTool:
         # PHASE 1 FIX: Create multiple mapping strategies for PDF URL matching
         # Strategy 1: Filename to URL mapping (for backwards compatibility)
         filename_to_url = {}
-        # Strategy 2: Document ID to URL mapping (more reliable)
-        document_id_to_url = {}
-        # Strategy 3: URL hash to URL mapping (most reliable)
+        # Strategy 2: URL hash to URL mapping (most reliable)
         url_hash_to_url = {}
         
         for pdf_info in downloaded_pdfs:
@@ -632,6 +633,20 @@ class CDMSLabelTool:
             "label_source": tavily_result.get("source", "CDMS"),
             "sources_tried": tavily_result.get("sources_tried", ["CDMS"]),
         }
+
+
+# ── Module-level singleton ────────────────────────────────────────────
+# CDMSLabelTool is expensive to initialize (Qdrant connection, two OpenAI
+# embedding services, SQLAlchemy engine, etc.).  Reusing one instance across
+# all queries saves ~1-3 s of pure re-initialization overhead per call.
+_cdms_tool_instance: "CDMSLabelTool | None" = None
+
+
+def _get_cdms_tool() -> "CDMSLabelTool":
+    global _cdms_tool_instance
+    if _cdms_tool_instance is None:
+        _cdms_tool_instance = CDMSLabelTool()
+    return _cdms_tool_instance
 
 
 # ── Shared constants for product extraction ──────────────────────────
@@ -839,8 +854,8 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
         print(f"🏷️  Extracted product_name = '{product_name}' "
               f"(from {'question' if product_from_current_question else 'context'})")
         
-        # ── Create tool and prepare enhanced question ───────────────────
-        tool = CDMSLabelTool()
+        # ── Get (or create) shared tool instance ────────────────────────
+        tool = _get_cdms_tool()
         enhanced_question = question
         
         # Detect follow-up question types
