@@ -171,7 +171,7 @@ class DocumentLoader:
                 
                 chunks = result.get("chunks", [])
                 page_numbers = result.get("page_numbers", [])
-                
+
                 # PHASE 2 FIX: Validate page numbers with warnings
                 if not page_numbers:
                     print(f"⚠️  Warning: No page numbers provided for {pdf_path.name}, estimating...")
@@ -184,19 +184,31 @@ class DocumentLoader:
                         page_numbers.extend([last_page] * (len(chunks) - len(page_numbers)))
                     else:
                         page_numbers = page_numbers[:len(chunks)]
-                
+
+                # Pre-compute url_hash once (same for all chunks in this PDF)
+                url_hash = ""
+                if pdf_url:
+                    import hashlib
+                    url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:12]
+
+                can_embed = bool(self.embedding_service and self.vector_store)
+                if not can_embed:
+                    if not self.embedding_service:
+                        print(f"⚠️  Warning: Embedding service not available, skipping embeddings for {pdf_path.name}")
+                    if not self.vector_store:
+                        print(f"⚠️  Warning: Vector store not available, skipping embeddings for {pdf_path.name}")
+
+                # First pass: store chunks in DB and collect data for batch embedding
+                embed_queue = []  # (chunk_id, chunk_text, metadata)
+
                 for idx, (chunk_text, page_num) in enumerate(zip(chunks, page_numbers)):
                     # PHASE 2 FIX: Validate page number is positive
                     if page_num <= 0:
                         print(f"⚠️  Warning: Invalid page number {page_num} for chunk {idx} in {pdf_path.name}, using estimated value")
-                        # Estimate page number based on chunk index
                         page_num = (idx // 3) + 1
                         page_numbers[idx] = page_num
                     chunk_id = DocumentChunk.generate_id(doc_id, idx)
-                    
-                    # Calculate token count (rough estimate: 1 token ≈ 4 chars)
-                    token_count = len(chunk_text) // 4
-                    
+
                     chunk = DocumentChunk(
                         id=chunk_id,
                         document_id=doc_id,
@@ -204,40 +216,40 @@ class DocumentLoader:
                         content=chunk_text,
                         page_number=page_num,  # ENHANCED: Accurate page number from PDF processor
                         char_count=len(chunk_text),
-                        token_count=token_count
+                        token_count=len(chunk_text) // 4
                     )
-                    
                     session.merge(chunk)
-                    
-                    # Generate embedding and store in Qdrant
-                    if self.embedding_service and self.vector_store:
-                        try:
-                            embedding = self.embedding_service.generate_embedding(chunk_text)
-                            
-                            # Validate embedding was generated
+                    chunks_stored += 1
+
+                    if can_embed:
+                        metadata = {
+                            "document_id": doc_id,
+                            "document_name": pdf_path.name,
+                            "chunk_index": idx,
+                            "content": chunk_text,
+                            "page_number": page_num,
+                            "source_file": pdf_path.name,
+                            "pdf_url": pdf_url if pdf_url else "",
+                            "url_hash": url_hash,
+                            "product_name": (product_name or "").lower()
+                        }
+                        embed_queue.append((chunk_id, chunk_text, metadata))
+
+                # Second pass: batch-embed all chunks in a single OpenAI API call
+                if embed_queue:
+                    try:
+                        ids = [item[0] for item in embed_queue]
+                        texts = [item[1] for item in embed_queue]
+                        metadatas = [item[2] for item in embed_queue]
+
+                        embeddings = self.embedding_service.generate_embeddings_batch(texts)
+
+                        for chunk_id, embedding, metadata in zip(ids, embeddings, metadatas):
                             if not embedding:
-                                print(f"⚠️  Warning: Failed to generate embedding for chunk {idx} in {pdf_path.name}")
+                                print(f"⚠️  Warning: Failed to generate embedding for chunk {metadata['chunk_index']} in {pdf_path.name}")
                             elif len(embedding) != 1536:
-                                print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {idx} in {pdf_path.name}")
+                                print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {metadata['chunk_index']} in {pdf_path.name}")
                             else:
-                                # PHASE 1 FIX: Generate URL hash for matching
-                                url_hash = ""
-                                if pdf_url:
-                                    import hashlib
-                                    url_hash = hashlib.md5(pdf_url.encode()).hexdigest()[:12]
-                                
-                                metadata = {
-                                    "document_id": doc_id,
-                                    "document_name": pdf_path.name,
-                                    "chunk_index": idx,
-                                    "content": chunk_text,  # Store full content for search
-                                    "page_number": page_num,  # ENHANCED: Accurate page number
-                                    "source_file": pdf_path.name,
-                                    "pdf_url": pdf_url if pdf_url else "",  # PHASE 1 FIX: Store PDF URL in metadata
-                                    "url_hash": url_hash,  # PHASE 1 FIX: Store URL hash for reliable matching
-                                    "product_name": (product_name or "").lower()  # For Qdrant native filtering
-                                }
-                                
                                 success = self.vector_store.add_document_chunk(
                                     chunk_id=chunk_id,
                                     embedding=embedding,
@@ -246,19 +258,11 @@ class DocumentLoader:
                                 if success:
                                     embeddings_generated += 1
                                 else:
-                                    print(f"⚠️  Warning: Failed to store chunk {idx} in Qdrant for {pdf_path.name}")
-                        except Exception as e:
-                            print(f"⚠️  Warning: Could not generate embedding for chunk {idx}: {e}")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        # Log why embeddings aren't being generated
-                        if not self.embedding_service:
-                            print(f"⚠️  Warning: Embedding service not available, skipping embeddings for chunk {idx}")
-                        if not self.vector_store:
-                            print(f"⚠️  Warning: Vector store not available, skipping embeddings for chunk {idx}")
-                    
-                    chunks_stored += 1
+                                    print(f"⚠️  Warning: Failed to store chunk {metadata['chunk_index']} in Qdrant for {pdf_path.name}")
+                    except Exception as e:
+                        print(f"⚠️  Warning: Batch embedding failed for {pdf_path.name}: {e}")
+                        import traceback
+                        traceback.print_exc()
             
             # Commit outside no_autoflush — now all merges happen in one batch
             session.commit()

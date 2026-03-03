@@ -5,6 +5,7 @@ Search for pesticide product labels from the CDMS database with full citations
 
 from typing import Dict, Any, Optional
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 
 # Add project root to path
@@ -231,28 +232,33 @@ class CDMSLabelTool:
                 }
         
         print(f"📥 Found {len(pdf_urls)} PDF URL(s) to download for {product_name}")
-        
-        # Download top 3 PDFs
+
+        # Download top 3 PDFs in parallel
+        urls_to_download = pdf_urls[:3]
         downloaded_pdfs = []
         errors = []
-        
-        for i, url in enumerate(pdf_urls[:3], 1):  # Top 3
-            print(f"   Downloading PDF {i}/{min(len(pdf_urls), 3)}: {url[:60]}...")
-            result = self.pdf_downloader.download_pdf(url, product_name)
-            if result.get("success"):
-                cached_status = "cached" if result.get("cached") else "downloaded"
-                print(f"   ✅ {cached_status}: {result.get('filename')}")
-                downloaded_pdfs.append({
-                    "filepath": result["filepath"],
-                    "filename": result["filename"],
-                    "cached": result["cached"],
-                    "url": result["url"],
-                    "url_hash": result["url_hash"]
-                })
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                print(f"   ❌ Failed: {error_msg}")
-                errors.append(f"Failed to download {url}: {error_msg}")
+
+        def _download_one(url):
+            return url, self.pdf_downloader.download_pdf(url, product_name)
+
+        with ThreadPoolExecutor(max_workers=len(urls_to_download)) as executor:
+            futures = {executor.submit(_download_one, url): url for url in urls_to_download}
+            for future in as_completed(futures):
+                url, result = future.result()
+                if result.get("success"):
+                    cached_status = "cached" if result.get("cached") else "downloaded"
+                    print(f"   ✅ {cached_status}: {result.get('filename')} ({url[:60]}...)")
+                    downloaded_pdfs.append({
+                        "filepath": result["filepath"],
+                        "filename": result["filename"],
+                        "cached": result["cached"],
+                        "url": result["url"],
+                        "url_hash": result["url_hash"]
+                    })
+                else:
+                    error_msg = result.get('error', 'Unknown error')
+                    print(f"   ❌ Failed: {error_msg}")
+                    errors.append(f"Failed to download {url}: {error_msg}")
         
         if downloaded_pdfs:
             print(f"✅ Successfully downloaded {len(downloaded_pdfs)} PDF(s)")
