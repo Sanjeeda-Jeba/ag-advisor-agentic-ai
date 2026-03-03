@@ -5,6 +5,7 @@ Search for pesticide product labels from the CDMS database with full citations
 
 from typing import Dict, Any, Optional
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 
 # Add project root to path
@@ -231,28 +232,33 @@ class CDMSLabelTool:
                 }
         
         print(f"📥 Found {len(pdf_urls)} PDF URL(s) to download for {product_name}")
-        
-        # Download top 3 PDFs
+
+        # Download top 3 PDFs in parallel
+        urls_to_download = pdf_urls[:3]
         downloaded_pdfs = []
         errors = []
-        
-        for i, url in enumerate(pdf_urls[:3], 1):  # Top 3
-            print(f"   Downloading PDF {i}/{min(len(pdf_urls), 3)}: {url[:60]}...")
-            result = self.pdf_downloader.download_pdf(url, product_name)
-            if result.get("success"):
-                cached_status = "cached" if result.get("cached") else "downloaded"
-                print(f"   ✅ {cached_status}: {result.get('filename')}")
-                downloaded_pdfs.append({
-                    "filepath": result["filepath"],
-                    "filename": result["filename"],
-                    "cached": result["cached"],
-                    "url": result["url"],
-                    "url_hash": result["url_hash"]
-                })
-            else:
-                error_msg = result.get('error', 'Unknown error')
-                print(f"   ❌ Failed: {error_msg}")
-                errors.append(f"Failed to download {url}: {error_msg}")
+
+        def _download_one(url):
+            return url, self.pdf_downloader.download_pdf(url, product_name)
+
+        with ThreadPoolExecutor(max_workers=len(urls_to_download)) as executor:
+            futures = {executor.submit(_download_one, url): url for url in urls_to_download}
+            for future in as_completed(futures):
+                url, result = future.result()
+                if result.get("success"):
+                    cached_status = "cached" if result.get("cached") else "downloaded"
+                    print(f"   ✅ {cached_status}: {result.get('filename')} ({url[:60]}...)")
+                    downloaded_pdfs.append({
+                        "filepath": result["filepath"],
+                        "filename": result["filename"],
+                        "cached": result["cached"],
+                        "url": result["url"],
+                        "url_hash": result["url_hash"]
+                    })
+                else:
+                    error_msg = result.get('error', 'Unknown error')
+                    print(f"   ❌ Failed: {error_msg}")
+                    errors.append(f"Failed to download {url}: {error_msg}")
         
         if downloaded_pdfs:
             print(f"✅ Successfully downloaded {len(downloaded_pdfs)} PDF(s)")
@@ -266,6 +272,31 @@ class CDMSLabelTool:
             "errors": errors if errors else None
         }
     
+    def _product_is_indexed(self, product_name: str) -> bool:
+        """
+        Return True if Qdrant already has at least one chunk for this product.
+        Uses a lightweight scroll (no embedding needed) so it's very fast.
+        """
+        if not self.rag_search.vector_store:
+            return False
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            points, _ = self.rag_search.vector_store.client.scroll(
+                collection_name="cdms_documents",
+                scroll_filter=Filter(
+                    must=[FieldCondition(
+                        key="product_name",
+                        match=MatchValue(value=product_name.lower())
+                    )]
+                ),
+                limit=1,
+                with_payload=False,
+                with_vectors=False,
+            )
+            return len(points) > 0
+        except Exception:
+            return False
+
     def _is_pdf_indexed(self, pdf_path: str) -> bool:
         """
         Check if PDF is already indexed in both database AND Qdrant
@@ -339,6 +370,39 @@ class CDMSLabelTool:
                 - pdfs_indexed: int
                 - total_chunks_found: int
         """
+        # Fast path: if this product is already indexed in Qdrant, skip the entire
+        # Tavily → download → index pipeline and jump straight to RAG search.
+        # The chunks already carry pdf_url in their metadata so citations still work.
+        if self._product_is_indexed(product_name):
+            print(f"✅ '{product_name}' already in Qdrant — skipping Tavily/download/index")
+            rag_chunks = self.rag_search.search(
+                query=user_question,
+                product_name=product_name,
+                limit=5,
+                score_threshold=0.3,
+            )
+            print(f"   Found {len(rag_chunks)} chunk(s) from cached index")
+            # Recover PDF URLs stored in Qdrant chunk metadata so the LLM
+            # response generator can build proper download links.
+            pdf_urls = list({c["pdf_url"] for c in rag_chunks if c.get("pdf_url")})
+            return {
+                "success": True,
+                "product_name": product_name,
+                "rag_chunks": rag_chunks,
+                "pdfs_downloaded": 0,
+                "pdfs_indexed": 0,
+                "total_chunks_found": len(rag_chunks),
+                "summary": "",
+                "labels": [],
+                "citations": "",
+                "tavily_results": {},
+                "download_info": {},
+                "pdf_urls": pdf_urls,
+                "tavily_labels": [],
+                "label_source": "cache",
+                "sources_tried": ["cache"],
+            }
+
         # Step 1: Search for label PDFs across multiple databases (CDMS → Greenbook → EPA → …)
         print(f"🔍 Step 1: Searching label databases for '{product_name}' (fallback chain)...")
         tavily_result = self.search(
@@ -378,42 +442,44 @@ class CDMSLabelTool:
         
         downloaded_pdfs = download_result.get("downloaded_pdfs", [])
         
-        # Step 3: Process and index PDFs (if not already indexed)
-        pdfs_indexed = 0
+        # Step 3: Process and index PDFs in parallel (if not already indexed)
+        # SQLite is configured with WAL mode + check_same_thread=False, and each
+        # load_pdf call creates its own session, so concurrent indexing is safe.
         print(f"📚 Indexing {len(downloaded_pdfs)} downloaded PDF(s)...")
-        for pdf_info in downloaded_pdfs:
+
+        def _index_one(pdf_info):
             pdf_path = pdf_info["filepath"]
-            pdf_url = pdf_info.get("url", "")  # PHASE 1 FIX: Get URL from download info
-            
-            # Check if already indexed
-            is_indexed = self._is_pdf_indexed(pdf_path)
-            if is_indexed:
+            pdf_url = pdf_info.get("url", "")
+            if self._is_pdf_indexed(pdf_path):
                 print(f"   ⏭️  {Path(pdf_path).name}: Already indexed (skipping)")
-            else:
-                # Process and index with PDF URL
-                print(f"   📄 Indexing: {Path(pdf_path).name}...")
-                try:
-                    index_result = self.document_loader.load_pdf(
-                        pdf_path, 
-                        force_reprocess=False,
-                        pdf_url=pdf_url,  # PHASE 1 FIX: Pass PDF URL to store in metadata
-                        product_name=product_name  # For Qdrant native filtering
-                    )
-                    if index_result.get("success"):
-                        chunks = index_result.get("chunks_stored", 0)
-                        embeddings = index_result.get("embeddings_generated", 0)
-                        if index_result.get("skipped"):
-                            print(f"   ⏭️  {Path(pdf_path).name}: Already processed (skipped)")
-                        else:
-                            print(f"   ✅ {Path(pdf_path).name}: {chunks} chunks, {embeddings} embeddings")
-                            pdfs_indexed += 1
-                    else:
-                        error = index_result.get("error", "Unknown error")
-                        print(f"   ❌ Failed to index {Path(pdf_path).name}: {error}")
-                except Exception as e:
-                    print(f"   ❌ Error indexing {Path(pdf_path).name}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                return 0
+            print(f"   📄 Indexing: {Path(pdf_path).name}...")
+            try:
+                index_result = self.document_loader.load_pdf(
+                    pdf_path,
+                    force_reprocess=False,
+                    pdf_url=pdf_url,
+                    product_name=product_name
+                )
+                if index_result.get("success"):
+                    if index_result.get("skipped"):
+                        print(f"   ⏭️  {Path(pdf_path).name}: Already processed (skipped)")
+                        return 0
+                    chunks = index_result.get("chunks_stored", 0)
+                    embeddings = index_result.get("embeddings_generated", 0)
+                    print(f"   ✅ {Path(pdf_path).name}: {chunks} chunks, {embeddings} embeddings")
+                    return 1
+                else:
+                    print(f"   ❌ Failed to index {Path(pdf_path).name}: {index_result.get('error', 'Unknown error')}")
+                    return 0
+            except Exception as e:
+                print(f"   ❌ Error indexing {Path(pdf_path).name}: {e}")
+                import traceback
+                traceback.print_exc()
+                return 0
+
+        with ThreadPoolExecutor(max_workers=len(downloaded_pdfs) or 1) as executor:
+            pdfs_indexed = sum(executor.map(_index_one, downloaded_pdfs))
         
         # Step 4: Verify Qdrant has chunks before searching
         qdrant_chunks_count = 0
@@ -448,9 +514,7 @@ class CDMSLabelTool:
         # PHASE 1 FIX: Create multiple mapping strategies for PDF URL matching
         # Strategy 1: Filename to URL mapping (for backwards compatibility)
         filename_to_url = {}
-        # Strategy 2: Document ID to URL mapping (more reliable)
-        document_id_to_url = {}
-        # Strategy 3: URL hash to URL mapping (most reliable)
+        # Strategy 2: URL hash to URL mapping (most reliable)
         url_hash_to_url = {}
         
         for pdf_info in downloaded_pdfs:
@@ -569,6 +633,20 @@ class CDMSLabelTool:
             "label_source": tavily_result.get("source", "CDMS"),
             "sources_tried": tavily_result.get("sources_tried", ["CDMS"]),
         }
+
+
+# ── Module-level singleton ────────────────────────────────────────────
+# CDMSLabelTool is expensive to initialize (Qdrant connection, two OpenAI
+# embedding services, SQLAlchemy engine, etc.).  Reusing one instance across
+# all queries potentially saves seconds of pure re-initialization overhead per call.
+_cdms_tool_instance: "CDMSLabelTool | None" = None
+
+
+def _get_cdms_tool() -> "CDMSLabelTool":
+    global _cdms_tool_instance
+    if _cdms_tool_instance is None:
+        _cdms_tool_instance = CDMSLabelTool()
+    return _cdms_tool_instance
 
 
 # ── Shared constants for product extraction ──────────────────────────
@@ -776,8 +854,8 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
         print(f"🏷️  Extracted product_name = '{product_name}' "
               f"(from {'question' if product_from_current_question else 'context'})")
         
-        # ── Create tool and prepare enhanced question ───────────────────
-        tool = CDMSLabelTool()
+        # ── Get (or create) shared tool instance ────────────────────────
+        tool = _get_cdms_tool()
         enhanced_question = question
         
         # Detect follow-up question types
