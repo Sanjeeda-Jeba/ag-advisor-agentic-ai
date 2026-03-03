@@ -5,6 +5,7 @@ Searches Qdrant vector database for CDMS label information with page citations
 
 import sys
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 # Add project root to path
@@ -88,9 +89,23 @@ class CDMSRAGSearch:
             return []
         
         try:
-            # Generate query embedding
-            query_embedding = self.embedding_service.generate_embedding(query)
-            
+            rei_keywords = ["rei", "re-entry", "reentry", "restricted entry"]
+            query_lower = query.lower()
+            has_rei_keywords = any(kw in query_lower for kw in rei_keywords)
+            rei_query = f"{product_name or ''} re-entry interval restricted entry agricultural use requirements"
+
+            # Pre-generate REI embedding in parallel with query embedding when needed,
+            # so it's ready if the primary search comes back without REI content.
+            if has_rei_keywords and self.embedding_service:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    query_future = executor.submit(self.embedding_service.generate_embedding, query)
+                    rei_future = executor.submit(self.embedding_service.generate_embedding, rei_query)
+                    query_embedding = query_future.result()
+                    pregenerated_rei_embedding = rei_future.result()
+            else:
+                query_embedding = self.embedding_service.generate_embedding(query)
+                pregenerated_rei_embedding = None
+
             if not query_embedding:
                 print("⚠️  Warning: Failed to generate query embedding")
                 return []
@@ -129,16 +144,13 @@ class CDMSRAGSearch:
                 print(f"   🔍 Post-filter fallback: {len(results)} result(s)")
             
             # ── REI keyword boost (product-scoped) ──
-            rei_keywords = ["rei", "re-entry", "reentry", "restricted entry"]
-            query_lower = query.lower()
-            if any(kw in query_lower for kw in rei_keywords):
+            if has_rei_keywords:
                 has_rei = any(
                     any(kw in r.get("content", "").lower() for kw in rei_keywords)
                     for r in results
                 )
                 if not has_rei and self.vector_store and self.embedding_service:
-                    rei_query = f"{product_name or ''} re-entry interval restricted entry agricultural use requirements"
-                    rei_embedding = self.embedding_service.generate_embedding(rei_query)
+                    rei_embedding = pregenerated_rei_embedding or self.embedding_service.generate_embedding(rei_query)
                     if rei_embedding:
                         # Search with product filter so only this product's REI is returned
                         rei_results = self.vector_store.search_documents(
