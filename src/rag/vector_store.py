@@ -97,47 +97,61 @@ class QdrantVectorStore:
                 pass  # Collection might already exist
     
     def add_document_chunk(
-        self, 
-        chunk_id: str, 
-        embedding: List[float], 
+        self,
+        chunk_id: str,
+        embedding: List[float],
         metadata: Dict
     ):
         """
-        Add PDF chunk to vector store
-        
-        Args:
-            chunk_id: Unique identifier for the chunk (string, will be converted to int)
-            embedding: Vector embedding (1536 dimensions)
-            metadata: Dict with chunk metadata
+        Add a single PDF chunk to vector store.
+        Prefer add_document_chunks_batch() when adding multiple chunks.
         """
-        try:
-            # Validate embedding
+        return self.add_document_chunks_batch(
+            [{"chunk_id": chunk_id, "embedding": embedding, "metadata": metadata}]
+        ) == 1
+
+    def add_document_chunks_batch(self, chunks: List[Dict]) -> int:
+        """
+        Add multiple PDF chunks in a single Qdrant upsert call.
+
+        Args:
+            chunks: List of dicts, each with keys:
+                - chunk_id (str): unique chunk identifier
+                - embedding (List[float]): 1536-dim vector
+                - metadata (Dict): payload stored alongside the vector
+
+        Returns:
+            Number of chunks successfully upserted.
+        """
+        import hashlib
+
+        points = []
+        for item in chunks:
+            chunk_id = item["chunk_id"]
+            embedding = item["embedding"]
+            metadata = item["metadata"]
+
             if not embedding:
                 print(f"⚠️  Warning: Empty embedding for chunk {chunk_id}, skipping")
-                return False
-            
+                continue
             if len(embedding) != self.embedding_dim:
-                print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} (expected {self.embedding_dim}) for chunk {chunk_id}")
-                return False
-            
-            # Convert string ID to integer hash for Qdrant (Qdrant requires int or UUID)
-            import hashlib
-            int_id = int(hashlib.md5(chunk_id.encode()).hexdigest()[:15], 16)  # Use first 15 hex chars as int
-            
-            self.client.upsert(
-                collection_name="cdms_documents",
-                points=[PointStruct(
-                    id=int_id,  # Qdrant requires integer or UUID
-                    vector=embedding,
-                    payload=metadata
-                )]
-            )
-            return True
+                print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {chunk_id}, skipping")
+                continue
+
+            int_id = int(hashlib.md5(chunk_id.encode()).hexdigest()[:15], 16)
+            points.append(PointStruct(id=int_id, vector=embedding, payload=metadata))
+
+        if not points:
+            return 0
+
+        try:
+            self.client.upsert(collection_name="cdms_documents", points=points)
+            return len(points)
         except Exception as e:
-            print(f"⚠️  Warning: Could not add chunk to Qdrant: {e}")
+            print(f"⚠️  Warning: Could not batch-add {len(points)} chunks to Qdrant: {e}")
             import traceback
             traceback.print_exc()
-            return False
+            return 0
     
     def search_documents(
         self, 

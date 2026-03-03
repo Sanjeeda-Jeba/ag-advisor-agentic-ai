@@ -235,7 +235,8 @@ class DocumentLoader:
                         }
                         embed_queue.append((chunk_id, chunk_text, metadata))
 
-                # Second pass: batch-embed all chunks in a single OpenAI API call
+                # Second pass: batch-embed all chunks in a single OpenAI API call,
+                # then batch-upsert all embeddings into Qdrant in a single call.
                 if embed_queue:
                     try:
                         ids = [item[0] for item in embed_queue]
@@ -244,23 +245,22 @@ class DocumentLoader:
 
                         embeddings = self.embedding_service.generate_embeddings_batch(texts)
 
+                        # Build valid points, logging any bad embeddings
+                        batch = []
                         for chunk_id, embedding, metadata in zip(ids, embeddings, metadatas):
                             if not embedding:
                                 print(f"⚠️  Warning: Failed to generate embedding for chunk {metadata['chunk_index']} in {pdf_path.name}")
                             elif len(embedding) != 1536:
                                 print(f"⚠️  Warning: Invalid embedding dimension {len(embedding)} for chunk {metadata['chunk_index']} in {pdf_path.name}")
                             else:
-                                success = self.vector_store.add_document_chunk(
-                                    chunk_id=chunk_id,
-                                    embedding=embedding,
-                                    metadata=metadata
-                                )
-                                if success:
-                                    embeddings_generated += 1
-                                else:
-                                    print(f"⚠️  Warning: Failed to store chunk {metadata['chunk_index']} in Qdrant for {pdf_path.name}")
+                                batch.append({"chunk_id": chunk_id, "embedding": embedding, "metadata": metadata})
+
+                        if batch:
+                            embeddings_generated = self.vector_store.add_document_chunks_batch(batch)
+                            if embeddings_generated < len(batch):
+                                print(f"⚠️  Warning: Only {embeddings_generated}/{len(batch)} chunks stored in Qdrant for {pdf_path.name}")
                     except Exception as e:
-                        print(f"⚠️  Warning: Batch embedding failed for {pdf_path.name}: {e}")
+                        print(f"⚠️  Warning: Batch embedding/upsert failed for {pdf_path.name}: {e}")
                         import traceback
                         traceback.print_exc()
             
