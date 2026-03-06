@@ -9,7 +9,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, JSON, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, JSON, DateTime, text
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime
 import hashlib
@@ -72,16 +72,33 @@ class Feedback(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class QueryLog(Base):
+    """Log of all user queries (from any device) for analytics/CSV export"""
+    __tablename__ = 'query_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_query = Column(Text)
+    agent_response = Column(Text, nullable=True)
+    tool_used = Column(String)
+    success = Column(Integer, default=1)  # 1=success, 0=error
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class DatabaseManager:
     """Manages the CDMS database"""
     
-    def __init__(self, db_path: str = "data/cdms_metadata.db"):
+    def __init__(self, db_path: str = None):
         """
         Initialize database manager
         
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to SQLite database file. If None, uses AGADVISOR_DB_PATH
+                     env var, or falls back to data/cdms_metadata.db
         """
+        import os
+        if db_path is None:
+            db_path = os.environ.get("AGADVISOR_DB_PATH", "data/cdms_metadata.db")
+        db_path = str(Path(db_path).resolve())
         # Create data directory if it doesn't exist
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         
@@ -106,6 +123,17 @@ class DatabaseManager:
         
         # Create tables
         Base.metadata.create_all(self.engine)
+        # Migration: add agent_response to query_logs if missing (existing DBs)
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(text("SELECT agent_response FROM query_logs LIMIT 1"))
+        except Exception:
+            try:
+                with self.engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE query_logs ADD COLUMN agent_response TEXT"))
+                    conn.commit()
+            except Exception:
+                pass  # Column may already exist or table may not exist yet
     
     def get_session(self):
         """Get database session"""

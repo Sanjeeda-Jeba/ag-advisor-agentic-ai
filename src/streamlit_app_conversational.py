@@ -16,7 +16,7 @@ from src.parser import parse_query
 from src.utils.parameter_extractor import extract_keywords_from_query
 from src.tools.tool_matcher import ToolMatcher
 from src.tools.tool_executor import ToolExecutor
-from src.cdms.schema import DatabaseManager, Feedback
+from src.cdms.schema import DatabaseManager, Feedback, QueryLog
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -76,6 +76,77 @@ st.markdown("""
         line-height: 1.6;
         margin: 0 0 8px 6px;
         padding: 0;
+    }
+    
+    /* Sleek processing UI — progress bar & steps */
+    .proc-progress-wrap {
+        margin: 12px 0 16px 0;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #e8eef5;
+        height: 6px;
+    }
+    .proc-progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #1E88E5 0%, #4CAF50 100%);
+        border-radius: 8px;
+        transition: width 0.4s ease-out;
+    }
+    .proc-step {
+        padding: 6px 0;
+        border-left: 3px solid #e0e0e0;
+        margin-left: 8px;
+        padding-left: 12px;
+        transition: all 0.3s ease;
+    }
+    .proc-step.done {
+        border-left-color: #4CAF50;
+        opacity: 1;
+    }
+    .proc-step.active {
+        border-left-color: #1E88E5;
+        background: linear-gradient(90deg, rgba(30,136,229,0.08) 0%, transparent 100%);
+        border-radius: 8px;
+        margin: 4px 0 4px 8px;
+        padding: 8px 12px;
+        animation: proc-pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes proc-pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.85; }
+    }
+    .proc-hourglass {
+        display: inline-block;
+        animation: proc-hourglass-flip 1.5s ease-in-out infinite;
+    }
+    @keyframes proc-hourglass-flip {
+        0%, 100% { transform: rotate(0deg); }
+        50% { transform: rotate(180deg); }
+    }
+    .proc-step-label {
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: #333;
+    }
+    .proc-step-detail {
+        font-size: 0.8rem;
+        color: #666;
+        margin-top: 2px;
+    }
+    /* Loading spinner next to "Processing your question" */
+    .proc-loading-spinner {
+        display: inline-block;
+        width: 18px;
+        height: 18px;
+        border: 2px solid #e0e0e0;
+        border-top-color: #1E88E5;
+        border-radius: 50%;
+        animation: proc-spin 0.8s linear infinite;
+        vertical-align: middle;
+        margin-right: 8px;
+    }
+    @keyframes proc-spin {
+        to { transform: rotate(360deg); }
     }
 
     /* Pull invisible star buttons up over the colored HTML stars */
@@ -155,7 +226,7 @@ with col_new_chat:
         st.rerun()
 
 st.markdown(
-    '<div class="subtitle">Your intelligent farming assistant! Get weather data, soil information, pesticide labels (CDMS), and agriculture best practices with citations.</div>',
+    '<div class="subtitle">Our intelligent farming assistant! Get pesticide labels (CDMS), and chemical application best practices with citations.</div>',
     unsafe_allow_html=True
 )
 
@@ -165,50 +236,35 @@ st.markdown(
 
 # Example queries section at the top
 with st.expander("💡 Example Questions", expanded=False):
-    st.markdown("#### 🔍 Quick Search Tools")
+    st.markdown("#### 📄 Pesticide Labels (CDMS)")
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("🌤️ Weather", use_container_width=True, key="ex_weather"):
-            st.session_state.example_input = "What's the weather in London?"
+        if st.button("REI for Sevin", use_container_width=True, key="ex_rei"):
+            st.session_state.example_input = "What is the REI (re-entry interval) for Sevin?"
     
     with col2:
-        if st.button("🌱 Soil Data", use_container_width=True, key="ex_soil"):
-            st.session_state.example_input = "Show me soil data for Iowa"
+        if st.button("Roundup on Corn", use_container_width=True, key="ex_roundup"):
+            st.session_state.example_input = "Find the application rate for Roundup on corn."
     
     with col3:
-        if st.button("📄 CDMS Search", use_container_width=True, key="ex_cdms"):
-            st.session_state.example_input = "Find Roundup label"
+        if st.button("2,4-D Safety", use_container_width=True, key="ex_24d"):
+            st.session_state.example_input = "What are the safety precautions for 2,4-D herbicide?"
     
-    st.markdown("#### 🏷️ CDMS Pesticide Labels (with Citations)")
+    st.markdown("#### 🌾 General Agriculture")
     col4, col5, col6 = st.columns(3)
     
     with col4:
-        if st.button("🌿 Roundup Label", use_container_width=True, key="ex_roundup"):
-            st.session_state.example_input = "Find me the Roundup pesticide label"
+        if st.button("Spider Mites", use_container_width=True, key="ex_mites"):
+            st.session_state.example_input = "How do I control spider mites on soybean plants?"
     
     with col5:
-        if st.button("🐛 Sevin Label", use_container_width=True, key="ex_sevin"):
-            st.session_state.example_input = "Show me the Sevin insecticide label"
+        if st.button("Nitrogen Timing", use_container_width=True, key="ex_nitrogen"):
+            st.session_state.example_input = "When should I apply nitrogen fertilizer to winter wheat?"
     
     with col6:
-        if st.button("🌾 2,4-D Label", use_container_width=True, key="ex_24d"):
-            st.session_state.example_input = "Get the 2,4-D herbicide label"
-    
-    st.markdown("#### 🌐 Agriculture Web Search (with Citations)")
-    col7, col8, col9 = st.columns(3)
-    
-    with col7:
-        if st.button("🐜 Pest Control", use_container_width=True, key="ex_pest"):
-            st.session_state.example_input = "How to control aphids on tomato plants?"
-    
-    with col8:
-        if st.button("🌱 Fertilization", use_container_width=True, key="ex_fert"):
-            st.session_state.example_input = "Best practices for corn fertilization timing"
-    
-    with col9:
-        if st.button("🌍 Soil Health", use_container_width=True, key="ex_soil_health"):
-            st.session_state.example_input = "How to improve soil organic matter?"
+        if st.button("Blossom End Rot", use_container_width=True, key="ex_blossom"):
+            st.session_state.example_input = "What causes blossom end rot in tomatoes and how do I fix it?"
 
 st.markdown("---")
 
@@ -239,16 +295,23 @@ with chat_container:
             
             else:  # assistant
                 with st.chat_message("assistant"):
-                    # Processing details — muted toggle ABOVE the response
+                    # Processing details — collapsed dropdown (all steps ✅, progress bar)
                     metadata = message.get("metadata", {})
                     proc_log = metadata.get("processing_log", []) if metadata else []
                     if proc_log:
-                        log_html = "<br>".join(
-                            line.replace("**", "") for line in proc_log
-                        )
+                        lines = []
+                        for line in proc_log:
+                            clean = line.replace("**", "")
+                            if line.strip().startswith("**Step"):
+                                lines.append(f'<span class="proc-step done">✅ {clean}</span>')
+                            else:
+                                lines.append(f'<span class="proc-step-detail" style="margin-left:20px">{clean}</span>')
+                        log_html = "<br>".join(lines)
                         st.markdown(
                             f'<details class="proc-details">'
                             f'<summary>Processing details</summary>'
+                            f'<div class="proc-progress-wrap" style="margin:8px 0">'
+                            f'<div class="proc-progress-fill" style="width:100%"></div></div>'
                             f'<div class="proc-log">{log_html}</div>'
                             f'</details>',
                             unsafe_allow_html=True
@@ -352,193 +415,236 @@ has_new_input = user_input is not None and user_input.strip() != ""
 
 # Check for pending processing (after rerun)
 pending_processing_key = None
-for key in st.session_state.keys():
+for key in list(st.session_state.keys()):
     if key.startswith(f"processing_{st.session_state.current_chat_id}_"):
         pending_processing_key = key
         break
+
+# Processing state (multi-step with progressive display)
+proc_state = st.session_state.get("_proc_state")
 
 # ============================================================================
 # PROCESS QUERY
 # ============================================================================
 
-if has_new_input or pending_processing_key:
-    # Get current chat (already have it)
-    
+if has_new_input or pending_processing_key or (proc_state and proc_state.get("chat_id") == st.session_state.current_chat_id):
+    # --- New input: add user message and init processing state ---
     if has_new_input:
-        # New input - add user message and set processing flag
-        # Use message count before adding to create unique key
         msg_count_before = len(current_chat['messages'])
         processing_key = f"processing_{st.session_state.current_chat_id}_{msg_count_before}"
-        
-        # Add user message to current chat
         current_chat['messages'].append({
             "role": "user",
             "content": user_input,
             "timestamp": time.time()
         })
         st.session_state[processing_key] = user_input
-        # Rerun immediately to show user message
+        st.session_state["_proc_state"] = {
+            "chat_id": st.session_state.current_chat_id,
+            "step": 0,
+            "log": [],
+            "question": user_input,
+            "processing_key": processing_key,
+        }
         st.rerun()
-    else:
-        # Pending processing - continue with existing processing key
-        processing_key = pending_processing_key
     
-    # Get the question to process (from session state)
-    question_to_process = st.session_state.get(processing_key, user_input if has_new_input else "")
+    # --- Get processing state ---
+    proc_state = st.session_state.get("_proc_state", {})
+    processing_key = proc_state.get("processing_key") or pending_processing_key
+    question_to_process = proc_state.get("question", "") or st.session_state.get(processing_key, "")
     
-    # Processing — show a simple spinner; collect detailed log for the
-    # dropdown that persists in the chat history after processing.
-    processing_log = []   # collects lines for the post-response expander
+    # --- Sleek processing UI: spinner + progress bar + steps — as assistant message ---
+    step = proc_state.get("step", 0)
+    log = proc_state.get("log", [])
+    # Progress bar: 0→25→50→75→90→100 as steps complete
+    progress_pct = (step * 25) if step < 4 else 90
+    
+    with st.chat_message("assistant"):
+        with st.status("Processing your question...", expanded=True, state="running"):
+            # Loading spinner (always visible next to header)
+            st.markdown(
+                '<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px">'
+                '<span class="proc-loading-spinner"></span>'
+                '<span style="font-size:0.9rem;color:#555;font-weight:500">Processing your question...</span>'
+                '</div>',
+                unsafe_allow_html=True
+            )
+            # Progress bar (fills sequentially with each task)
+            st.markdown(
+                f'<div class="proc-progress-wrap">'
+                f'<div class="proc-progress-fill" style="width:{progress_pct}%"></div>'
+                f'</div>'
+                f'<div style="font-size:0.75rem;color:#999;margin-top:4px">'
+                f'Step {min(step + 1, 4)} of 4</div>',
+                unsafe_allow_html=True
+            )
+            if not log:
+                st.caption("Analyzing your question...")
+            else:
+                step_header_idxs = [i for i, L in enumerate(log) if L.strip().startswith("**Step")]
+                last_step_idx = step_header_idxs[-1] if step_header_idxs else -1
+                for i, line in enumerate(log):
+                    clean = line.replace("**", "")
+                    if line.strip().startswith("**Step"):
+                        is_active = i == last_step_idx
+                        cls = "active" if is_active else "done"
+                        icon = '<span class="proc-hourglass">⏳</span>' if is_active else "✅"
+                        st.markdown(
+                            f'<div class="proc-step {cls}">'
+                            f'<span class="proc-step-label">{icon} {clean}</span></div>',
+                            unsafe_allow_html=True
+                        )
+                    else:
+                        st.markdown(f'<div class="proc-step-detail" style="margin-left:20px">{clean}</div>', unsafe_allow_html=True)
+    
+    # --- Run next step ---
+    step = proc_state.get("step", 0)
+    log = list(proc_state.get("log", []))
+    keywords = proc_state.get("keywords", [])
+    conversation_context = proc_state.get("conversation_context", [])
+    selected_tool = proc_state.get("selected_tool", "cdms_label")
+    confidence = proc_state.get("confidence", 0.0)
+    method = proc_state.get("method", "unknown")
+    tool_result = proc_state.get("tool_result")
+    
     try:
-        with st.spinner("Processing your question..."):
-            # Step 1: Parse and extract keywords
-            processing_log.append("**Step 1:** 🔍 Analyzing your question...")
+        if step == 0:
+            log.append("**Step 1:** 🔍 Analyzing your question...")
             try:
                 parsed = parse_query(question_to_process)
                 keywords = parsed.get("extracted_keywords", [])
-                processing_log.append(f"   ✅ Keywords: {', '.join(keywords[:5])}")
-            except Exception as e:
-                processing_log.append(f"   ⚠️ Using direct matching")
+                log.append(f"   ✅ Keywords: {', '.join(keywords[:5])}")
+            except Exception:
+                log.append("   ⚠️ Using direct matching")
                 keywords = []
-            
-            # Step 2: Get conversation history for context
-            processing_log.append("**Step 2:** 🔄 Checking conversation context...")
-            conversation_context = []
+            st.session_state["_proc_state"] = {**proc_state, "step": 1, "log": log, "keywords": keywords}
+            st.rerun()
+        
+        if step == 1:
+            log.append("**Step 2:** 🔄 Checking conversation context...")
             if len(current_chat['messages']) > 1:
-                recent_messages = current_chat['messages'][-6:-1]
-                for msg in recent_messages:
-                    conversation_context.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-                processing_log.append(f"   ✅ Using context from {len(conversation_context)} previous messages")
+                recent = current_chat['messages'][-6:-1]
+                conversation_context = [{"role": m["role"], "content": m["content"]} for m in recent]
+                log.append(f"   ✅ Using context from {len(conversation_context)} previous messages")
             else:
-                processing_log.append(f"   ℹ️ No previous context")
-            
-            # Step 3: Match with tools
-            processing_log.append("**Step 3:** 🎯 Selecting best tool...")
+                log.append("   ℹ️ No previous context")
+            st.session_state["_proc_state"] = {**proc_state, "step": 2, "log": log, "conversation_context": conversation_context}
+            st.rerun()
+        
+        if step == 2:
+            log.append("**Step 3:** 🎯 Selecting best tool...")
             try:
                 tool_match = st.session_state.tool_matcher.match_tool(
-                    keywords,
-                    question_to_process,
-                    conversation_context=conversation_context
+                    keywords, question_to_process, conversation_context=conversation_context
                 )
                 selected_tool = tool_match["tool_name"]
                 confidence = tool_match["confidence"]
                 method = tool_match.get("method", "unknown")
-                llm_used = tool_match.get("llm_used", False)
-                
                 if method == "fast_path":
-                    processing_log.append(f"   ⚡ Fast path (keyword matching)")
+                    log.append("   ⚡ Fast path (keyword matching)")
                 elif method in ("llm_path", "llm_cached"):
-                    processing_log.append(f"   🧠 LLM classification ({'cached' if method == 'llm_cached' else 'live'})")
+                    log.append(f"   🧠 LLM classification ({'cached' if method == 'llm_cached' else 'live'})")
                 elif method == "hybrid":
-                    processing_log.append(f"   🔀 Hybrid (fast + LLM)")
+                    log.append("   🔀 Hybrid (fast + LLM)")
                 else:
-                    processing_log.append(f"   ⚙️ {method}")
-                
-                processing_log.append(f"   ✅ Selected: **{selected_tool}** ({confidence:.0%} confidence)")
-                
-                if llm_used and tool_match.get("llm_reasoning"):
-                    processing_log.append(f"   💭 Reasoning: {tool_match['llm_reasoning'][:100]}...")
-            except Exception as e:
-                processing_log.append(f"   ⚠️ Using default tool")
+                    log.append(f"   ⚙️ {method}")
+                log.append(f"   ✅ Selected: **{selected_tool}** ({confidence:.0%} confidence)")
+            except Exception:
+                log.append("   ⚠️ Using default tool")
                 selected_tool = "cdms_label"
                 confidence = 0.3
                 method = "fallback"
-            
-            # Step 4: Execute tool
-            processing_log.append(f"**Step 4:** ⚙️ Executing **{selected_tool}** tool...")
+            st.session_state["_proc_state"] = {**proc_state, "step": 3, "log": log, "selected_tool": selected_tool, "confidence": confidence, "method": method}
+            st.rerun()
+        
+        if step == 3:
+            # Add Step 4 to checklist first so it appears as "in progress", then rerun
+            log.append(f"**Step 4:** ⚙️ Executing **{selected_tool}** tool...")
+            st.session_state["_proc_state"] = {**proc_state, "step": 4, "log": log}
+            st.rerun()
+        
+        if step == 4:
             try:
                 tool_result = st.session_state.tool_executor.execute(
                     tool_name=selected_tool,
                     user_question=question_to_process,
                     conversation_context=conversation_context
                 )
-                
                 if not tool_result.get("success", False):
-                    error_msg = tool_result.get("error", "Unknown error")
-                    tool_result["llm_response"] = f"I encountered an error: {error_msg}"
-                    processing_log.append(f"   ❌ Error: {error_msg}")
+                    tool_result["llm_response"] = f"I encountered an error: {tool_result.get('error', 'Unknown error')}"
+                    log.append(f"   ❌ Error: {tool_result.get('error', 'Unknown error')}")
                 else:
                     if tool_result.get("fallback_used"):
-                        processing_log.append(f"   ⚠️ CDMS found no results, using agriculture web search as fallback")
+                        log.append("   ⚠️ CDMS found no results, using agriculture web search as fallback")
                     else:
-                        processing_log.append(f"   ✅ Tool executed successfully!")
-                        
+                        log.append("   ✅ Tool executed successfully!")
                         if selected_tool in ["cdms_label", "cdms", "pesticide_label"]:
-                            raw_data = tool_result.get("raw_data", {})
-                            pdfs_downloaded = raw_data.get("pdfs_downloaded", 0)
-                            pdfs_indexed = raw_data.get("pdfs_indexed", 0)
-                            if pdfs_downloaded > 0:
-                                processing_log.append(f"   📥 Downloaded {pdfs_downloaded} PDF(s)")
-                                if pdfs_indexed > 0:
-                                    processing_log.append(f"   📚 Indexed {pdfs_indexed} PDF(s) for RAG search")
-                                download_info = raw_data.get("download_info", {})
-                                downloaded_pdfs = download_info.get("downloaded_pdfs", [])
-                                for pdf in downloaded_pdfs[:3]:
+                            raw = tool_result.get("raw_data", {})
+                            pdfs_d = raw.get("pdfs_downloaded", 0)
+                            pdfs_i = raw.get("pdfs_indexed", 0)
+                            if pdfs_d > 0:
+                                log.append(f"   📥 Downloaded {pdfs_d} PDF(s)")
+                                if pdfs_i > 0:
+                                    log.append(f"   📚 Indexed {pdfs_i} PDF(s) for RAG search")
+                                for pdf in raw.get("download_info", {}).get("downloaded_pdfs", [])[:3]:
                                     cached = "cached" if pdf.get("cached") else "new"
-                                    processing_log.append(f"   📄 {pdf.get('filename', 'Unknown')} ({cached})")
-                
+                                    log.append(f"   📄 {pdf.get('filename', 'Unknown')} ({cached})")
             except Exception as e:
-                tool_result = {
-                    "success": False,
-                    "error": str(e),
-                    "llm_response": f"I encountered an error while processing your request: {str(e)}"
+                tool_result = {"success": False, "error": str(e), "llm_response": f"I encountered an error: {str(e)}"}
+                log.append(f"   ❌ Execution error: {str(e)}")
+            
+            # Done: add assistant message, clear state
+            response_text = tool_result.get("llm_response", "I couldn't process that request. Please try again.")
+            current_chat['messages'].append({
+                "role": "assistant",
+                "content": response_text,
+                "timestamp": time.time(),
+                "metadata": {
+                    "tool": tool_result.get("tool_used", selected_tool),
+                    "original_tool": selected_tool,
+                    "fallback_used": tool_result.get("fallback_used", False),
+                    "keywords": keywords,
+                    "confidence": confidence,
+                    "raw_data": tool_result.get("raw_data"),
+                    "success": tool_result.get("success", False),
+                    "error": tool_result.get("error") if not tool_result.get("success") else None,
+                    "has_context": len(conversation_context) > 0,
+                    "context_messages": len(conversation_context),
+                    "processing_log": log  # for collapsed dropdown after
                 }
-                processing_log.append(f"   ❌ Execution error: {str(e)}")
-        
-        # Add assistant response to current chat
-        response_text = tool_result.get("llm_response", "I couldn't process that request. Please try again.")
-        
-        current_chat['messages'].append({
-            "role": "assistant",
-            "content": response_text,
-            "timestamp": time.time(),
-            "metadata": {
-                "tool": tool_result.get("tool_used", selected_tool),
-                "original_tool": selected_tool,
-                "fallback_used": tool_result.get("fallback_used", False),
-                "keywords": keywords,
-                "confidence": confidence,
-                "raw_data": tool_result.get("raw_data"),
-                "success": tool_result.get("success", False),
-                "error": tool_result.get("error") if not tool_result.get("success") else None,
-                "has_context": len(conversation_context) > 0,
-                "context_messages": len(conversation_context),
-                "processing_log": processing_log  # saved for the dropdown
-            }
-        })
-        
-        # Clear processing flag
-        if processing_key in st.session_state:
-            del st.session_state[processing_key]
-        
-        # Rerun to show the new message
-        st.rerun()
+            })
+            # Log every query to shared DB (all users, all devices)
+            try:
+                db = DatabaseManager()
+                session = db.get_session()
+                session.add(QueryLog(
+                    user_query=question_to_process[:2000],
+                    agent_response=response_text[:5000] if response_text else None,
+                    tool_used=tool_result.get("tool_used", selected_tool),
+                    success=1 if tool_result.get("success", False) else 0,
+                ))
+                session.commit()
+                session.close()
+            except Exception:
+                pass
+            if "_proc_state" in st.session_state:
+                del st.session_state["_proc_state"]
+            if processing_key and processing_key in st.session_state:
+                del st.session_state[processing_key]
+            st.rerun()
     
     except Exception as e:
         st.error(f"Unexpected error: {str(e)}")
         import traceback
         st.code(traceback.format_exc())
-        
-        # Add error message to current chat
         current_chat['messages'].append({
             "role": "assistant",
             "content": f"I encountered an error: {str(e)}. Please check the error details above.",
             "timestamp": time.time(),
-            "metadata": {
-                "tool": "unknown",
-                "error": str(e)
-            }
+            "metadata": {"tool": "unknown", "error": str(e)}
         })
-        
-        # Clear processing flag (use the one from outer scope)
-        if 'processing_key' in locals() and processing_key in st.session_state:
-            del st.session_state[processing_key]
-        elif pending_processing_key and pending_processing_key in st.session_state:
-            del st.session_state[pending_processing_key]
-        
+        for k in ["_proc_state", processing_key]:
+            if k and k in st.session_state:
+                del st.session_state[k]
         st.rerun()
 
 # Clear chat button moved to sidebar
@@ -607,30 +713,50 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Feedback export
-    st.markdown("### 📊 Feedback")
+    # Feedback & Query Log export
+    st.markdown("### 📊 Data Export")
     try:
         db = DatabaseManager()
         session = db.get_session()
-        rows = session.query(Feedback).order_by(Feedback.created_at.desc()).all()
+        feedback_rows = session.query(Feedback).order_by(Feedback.created_at.desc()).all()
+        try:
+            query_rows = session.query(QueryLog).order_by(QueryLog.created_at.desc()).all()
+        except Exception:
+            query_rows = []
         session.close()
-        st.caption(f"{len(rows)} response(s) collected")
-        if rows:
+        st.caption(f"{len(feedback_rows)} feedback, {len(query_rows)} queries (all users)")
+        if feedback_rows:
             import io, csv
             buf = io.StringIO()
             writer = csv.writer(buf)
             writer.writerow(["id", "chat_id", "user_query", "agent_response", "tool_used", "rating", "comment", "created_at"])
-            for r in rows:
+            for r in feedback_rows:
                 writer.writerow([r.id, r.chat_id, r.user_query, r.agent_response, r.tool_used, r.rating, r.comment, r.created_at])
             st.download_button(
-                "Download CSV",
+                "Download Feedback CSV",
                 data=buf.getvalue(),
                 file_name="agadvisor_feedback.csv",
                 mime="text/csv",
                 use_container_width=True,
+                key="dl_feedback",
+            )
+        if query_rows:
+            import io, csv
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["id", "user_query", "agent_response", "tool_used", "success", "created_at"])
+            for r in query_rows:
+                writer.writerow([r.id, r.user_query, getattr(r, "agent_response", ""), r.tool_used, r.success, r.created_at])
+            st.download_button(
+                "Download Query Log CSV",
+                data=buf.getvalue(),
+                file_name="agadvisor_queries.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="dl_queries",
             )
     except Exception:
-        st.caption("Feedback DB not available")
+        st.caption("Database not available")
     
     st.markdown("---")
     
