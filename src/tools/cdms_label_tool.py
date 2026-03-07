@@ -373,7 +373,8 @@ class CDMSLabelTool:
             return {
                 "success": False,
                 "error": error_msg,
-                "product_name": product_name
+                "product_name": product_name,
+                "should_fallback": True  # PDF sources exhausted, try agriculture_web
             }
         
         downloaded_pdfs = download_result.get("downloaded_pdfs", [])
@@ -835,7 +836,8 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
             return {
                 "success": False,
                 "tool": "cdms_label",
-                "error": result.get("error", "CDMS RAG search failed")
+                "error": result.get("error", "CDMS RAG search failed"),
+                "should_fallback": result.get("should_fallback", False)
             }
         
         # Return successful result with RAG chunks and page citations
