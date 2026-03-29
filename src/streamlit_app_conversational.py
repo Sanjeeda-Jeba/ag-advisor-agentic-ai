@@ -13,10 +13,108 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.parser import parse_query
-from src.utils.parameter_extractor import extract_keywords_from_query
 from src.tools.tool_matcher import ToolMatcher
 from src.tools.tool_executor import ToolExecutor
 from src.cdms.schema import DatabaseManager, Feedback, QueryLog
+
+# Internal rerun steps: parse → context → route → gather plan → fetch → compose plan → LLM
+_PROCESS_PHASE_TOTAL = 7
+
+_CDMS_TOOLS_UI = frozenset(
+    {"cdms_label", "cdms", "pesticide_label", "rag", "documentation"}
+)
+
+
+def _gathering_substeps(tool: str) -> list:
+    """Human-readable substeps shown before the slow data-fetch phase."""
+    if tool in _CDMS_TOOLS_UI:
+        return [
+            "Query CDMS / label indexes and hybrid search (vector + metadata)",
+            "Download or reuse pesticide label PDFs when the catalog needs them",
+            "Score passages so the model can cite the right sections",
+        ]
+    if tool == "weather":
+        return [
+            "Geocode or resolve the place you mentioned",
+            "Call the live weather API for current conditions",
+        ]
+    if tool == "soil":
+        return [
+            "Resolve coordinates or region for SoilGrids / soil layers",
+            "Pull soil property values for your area",
+        ]
+    if tool in ("agriculture_web", "ag_web"):
+        return [
+            "Search agriculture-focused web sources (Tavily)",
+            "Rank snippets and collect URLs for citations",
+        ]
+    return ["Run the selected tool and collect structured results"]
+
+
+def _append_fetch_outcome_logs(log: list, fetch_result: dict, selected_tool: str) -> None:
+    """Append lines describing what actually came back from fetch_tool_data."""
+    if not fetch_result.get("success"):
+        log.append(f"   ❌ {fetch_result.get('error', 'Unknown error')}")
+        return
+
+    used = fetch_result.get("tool_used", selected_tool)
+    if fetch_result.get("fallback_used"):
+        log.append(
+            "   🔄 Used agriculture web search (CDMS requested a web fallback)"
+        )
+
+    data = fetch_result.get("data") or {}
+
+    if used == "weather":
+        loc = data.get("city") or data.get("location") or data.get("name")
+        if loc:
+            log.append(f"   🌤️ Location: {loc}")
+        desc = data.get("description") or data.get("conditions")
+        if desc:
+            short = desc if len(desc) < 120 else desc[:117] + "..."
+            log.append(f"   ☁️ Conditions: {short}")
+        if data.get("temperature") is not None:
+            log.append("   🌡️ Current temperature retrieved")
+        log.append("   ✅ Weather payload ready for the model")
+
+    elif used == "soil":
+        region = data.get("location") or data.get("area") or data.get("query")
+        if region:
+            log.append(f"   🌍 Soil query region: {region}")
+        log.append("   ✅ Soil data retrieved for synthesis")
+
+    elif used in _CDMS_TOOLS_UI:
+        n_chunks = int(data.get("total_chunks_found") or 0)
+        if n_chunks:
+            log.append(f"   📚 {n_chunks} relevant chunk(s) from labels / documents")
+        else:
+            log.append(
+                "   📚 No RAG chunks yet (may still have web context or new PDFs)"
+            )
+        if data.get("tavily_answer") or data.get("tavily_results"):
+            log.append("   🌐 Tavily / web context included where available")
+        pdfs_d = int(data.get("pdfs_downloaded") or 0)
+        pdfs_i = int(data.get("pdfs_indexed") or 0)
+        if pdfs_d > 0:
+            log.append(f"   📥 Downloaded {pdfs_d} PDF(s)")
+        if pdfs_i > 0:
+            log.append(f"   📖 Indexed {pdfs_i} PDF(s) for retrieval")
+        for pdf in (data.get("download_info") or {}).get("downloaded_pdfs", [])[:3]:
+            cached = "cached" if pdf.get("cached") else "new"
+            log.append(f"   📄 {pdf.get('filename', 'label.pdf')} ({cached})")
+        log.append("   ✅ Label / CDMS data ready for the model")
+
+    elif used in ("agriculture_web", "ag_web"):
+        n_src = int(data.get("source_count") or 0)
+        if n_src:
+            log.append(f"   🔎 Collected {n_src} web source(s) with snippets")
+        else:
+            log.append("   🔎 Web search completed")
+        log.append("   ✅ Sources ready for citation in your answer")
+
+    else:
+        log.append("   ✅ Tool data retrieved")
+
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -250,21 +348,6 @@ with st.expander("💡 Example Questions", expanded=False):
     with col3:
         if st.button("2,4-D Safety", use_container_width=True, key="ex_24d"):
             st.session_state.example_input = "What are the safety precautions for 2,4-D herbicide?"
-    
-    st.markdown("#### 🌾 General Agriculture")
-    col4, col5, col6 = st.columns(3)
-    
-    with col4:
-        if st.button("Spider Mites", use_container_width=True, key="ex_mites"):
-            st.session_state.example_input = "How do I control spider mites on soybean plants?"
-    
-    with col5:
-        if st.button("Nitrogen Timing", use_container_width=True, key="ex_nitrogen"):
-            st.session_state.example_input = "When should I apply nitrogen fertilizer to winter wheat?"
-    
-    with col6:
-        if st.button("Blossom End Rot", use_container_width=True, key="ex_blossom"):
-            st.session_state.example_input = "What causes blossom end rot in tomatoes and how do I fix it?"
 
 st.markdown("---")
 
@@ -455,8 +538,7 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
     # --- Sleek processing UI: spinner + progress bar + steps — as assistant message ---
     step = proc_state.get("step", 0)
     log = proc_state.get("log", [])
-    # Progress bar: 0→25→50→75→90→100 as steps complete
-    progress_pct = (step * 25) if step < 4 else 90
+    progress_pct = min(97, int((step + 1) / _PROCESS_PHASE_TOTAL * 97))
     
     with st.chat_message("assistant"):
         with st.status("Processing your question...", expanded=True, state="running"):
@@ -464,7 +546,7 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
             st.markdown(
                 '<div style="margin-bottom:12px;display:flex;align-items:center;gap:8px">'
                 '<span class="proc-loading-spinner"></span>'
-                '<span style="font-size:0.9rem;color:#555;font-weight:500">Processing your question...</span>'
+                '<span style="font-size:0.9rem;color:#555;font-weight:500">AgAdvisor is working on your question...</span>'
                 '</div>',
                 unsafe_allow_html=True
             )
@@ -474,7 +556,7 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
                 f'<div class="proc-progress-fill" style="width:{progress_pct}%"></div>'
                 f'</div>'
                 f'<div style="font-size:0.75rem;color:#999;margin-top:4px">'
-                f'Step {min(step + 1, 4)} of 4</div>',
+                f'Phase {min(step + 1, _PROCESS_PHASE_TOTAL)} of {_PROCESS_PHASE_TOTAL}</div>',
                 unsafe_allow_html=True
             )
             if not log:
@@ -504,34 +586,39 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
     selected_tool = proc_state.get("selected_tool", "cdms_label")
     confidence = proc_state.get("confidence", 0.0)
     method = proc_state.get("method", "unknown")
-    tool_result = proc_state.get("tool_result")
     
     try:
         if step == 0:
-            log.append("**Step 1:** 🔍 Analyzing your question...")
+            log.append("**Step 1:** 🔍 Understanding your question...")
+            log.append("   🧩 Language pass (spaCy): lemmas, entities, and key terms")
             try:
                 parsed = parse_query(question_to_process)
                 keywords = parsed.get("extracted_keywords", [])
-                log.append(f"   ✅ Keywords: {', '.join(keywords[:5])}")
+                preview = ", ".join(keywords[:10])
+                if len(keywords) > 10:
+                    preview += "…"
+                log.append(f"   ✅ {len(keywords)} term(s) extracted: {preview or '(none)'}")
             except Exception:
-                log.append("   ⚠️ Using direct matching")
+                log.append("   ⚠️ Parser skipped — tools will still match on your full question")
                 keywords = []
             st.session_state["_proc_state"] = {**proc_state, "step": 1, "log": log, "keywords": keywords}
             st.rerun()
         
         if step == 1:
-            log.append("**Step 2:** 🔄 Checking conversation context...")
+            log.append("**Step 2:** 🔄 Loading conversation context...")
             if len(current_chat['messages']) > 1:
                 recent = current_chat['messages'][-6:-1]
                 conversation_context = [{"role": m["role"], "content": m["content"]} for m in recent]
-                log.append(f"   ✅ Using context from {len(conversation_context)} previous messages")
+                log.append(
+                    f"   ✅ Using {len(conversation_context)} prior message(s) for follow-ups & clarity"
+                )
             else:
-                log.append("   ℹ️ No previous context")
+                log.append("   ℹ️ First message in this chat — no prior context")
             st.session_state["_proc_state"] = {**proc_state, "step": 2, "log": log, "conversation_context": conversation_context}
             st.rerun()
         
         if step == 2:
-            log.append("**Step 3:** 🎯 Selecting best tool...")
+            log.append("**Step 3:** 🎯 Routing to the right specialist...")
             try:
                 tool_match = st.session_state.tool_matcher.match_tool(
                     keywords, question_to_process, conversation_context=conversation_context
@@ -540,16 +627,20 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
                 confidence = tool_match["confidence"]
                 method = tool_match.get("method", "unknown")
                 if method == "fast_path":
-                    log.append("   ⚡ Fast path (keyword matching)")
+                    log.append("   ⚡ Fast path: keyword / rules routing")
                 elif method in ("llm_path", "llm_cached"):
-                    log.append(f"   🧠 LLM classification ({'cached' if method == 'llm_cached' else 'live'})")
+                    log.append(
+                        f"   🧠 LLM router ({'cached decision' if method == 'llm_cached' else 'live classification'})"
+                    )
                 elif method == "hybrid":
-                    log.append("   🔀 Hybrid (fast + LLM)")
+                    log.append("   🔀 Hybrid: quick signals + LLM check")
                 else:
-                    log.append(f"   ⚙️ {method}")
-                log.append(f"   ✅ Selected: **{selected_tool}** ({confidence:.0%} confidence)")
+                    log.append(f"   ⚙️ Router method: {method}")
+                log.append(
+                    f"   ✅ Tool: **{selected_tool}** ({confidence:.0%} confidence)"
+                )
             except Exception:
-                log.append("   ⚠️ Using default tool")
+                log.append("   ⚠️ Router error — defaulting to CDMS / label search")
                 selected_tool = "cdms_label"
                 confidence = 0.3
                 method = "fallback"
@@ -557,40 +648,75 @@ if has_new_input or pending_processing_key or (proc_state and proc_state.get("ch
             st.rerun()
         
         if step == 3:
-            # Add Step 4 to checklist first so it appears as "in progress", then rerun
-            log.append(f"**Step 4:** ⚙️ Executing **{selected_tool}** tool...")
+            log.append("**Step 4:** 📡 Gathering data (APIs, search, PDFs)...")
+            for line in _gathering_substeps(selected_tool):
+                log.append(f"   • {line}")
             st.session_state["_proc_state"] = {**proc_state, "step": 4, "log": log}
             st.rerun()
         
         if step == 4:
             try:
-                tool_result = st.session_state.tool_executor.execute(
+                fetch_result = st.session_state.tool_executor.fetch_tool_data(
                     tool_name=selected_tool,
                     user_question=question_to_process,
-                    conversation_context=conversation_context
+                    conversation_context=conversation_context,
                 )
-                if not tool_result.get("success", False):
-                    tool_result["llm_response"] = f"I encountered an error: {tool_result.get('error', 'Unknown error')}"
-                    log.append(f"   ❌ Error: {tool_result.get('error', 'Unknown error')}")
-                else:
-                    if tool_result.get("fallback_used"):
-                        log.append("   ⚠️ CDMS found no results, using agriculture web search as fallback")
-                    else:
-                        log.append("   ✅ Tool executed successfully!")
-                        if selected_tool in ["cdms_label", "cdms", "pesticide_label"]:
-                            raw = tool_result.get("raw_data", {})
-                            pdfs_d = raw.get("pdfs_downloaded", 0)
-                            pdfs_i = raw.get("pdfs_indexed", 0)
-                            if pdfs_d > 0:
-                                log.append(f"   📥 Downloaded {pdfs_d} PDF(s)")
-                                if pdfs_i > 0:
-                                    log.append(f"   📚 Indexed {pdfs_i} PDF(s) for RAG search")
-                                for pdf in raw.get("download_info", {}).get("downloaded_pdfs", [])[:3]:
-                                    cached = "cached" if pdf.get("cached") else "new"
-                                    log.append(f"   📄 {pdf.get('filename', 'Unknown')} ({cached})")
+                _append_fetch_outcome_logs(log, fetch_result, selected_tool)
             except Exception as e:
-                tool_result = {"success": False, "error": str(e), "llm_response": f"I encountered an error: {str(e)}"}
-                log.append(f"   ❌ Execution error: {str(e)}")
+                fetch_result = {"success": False, "error": str(e), "tool_used": selected_tool}
+                log.append(f"   ❌ Data fetch error: {str(e)}")
+            st.session_state["_proc_state"] = {
+                **proc_state,
+                "step": 5,
+                "log": log,
+                "fetch_result": fetch_result,
+            }
+            st.rerun()
+        
+        if step == 5:
+            log.append("**Step 5:** ✍️ Composing your answer with AI...")
+            log.append("   🤖 Grounding the reply in retrieved facts (citations, tone, safety)")
+            log.append("   ⏳ Often the longest step — synthesis and formatting")
+            st.session_state["_proc_state"] = {**proc_state, "step": 6, "log": log}
+            st.rerun()
+        
+        if step == 6:
+            fetch_result = proc_state.get("fetch_result") or {}
+            try:
+                if not fetch_result.get("success", False):
+                    err = fetch_result.get("error", "Unknown error")
+                    tool_result = {
+                        "success": False,
+                        "error": err,
+                        "llm_response": f"I encountered an error: {err}",
+                        "tool_used": fetch_result.get("tool_used", selected_tool),
+                    }
+                else:
+                    used = fetch_result["tool_used"]
+                    data = fetch_result.get("data", {})
+                    llm_response = st.session_state.tool_executor.compose_llm_response(
+                        user_question=question_to_process,
+                        tool_used=used,
+                        tool_data=data,
+                        conversation_context=conversation_context,
+                    )
+                    tool_result = {
+                        "success": True,
+                        "tool_used": used,
+                        "raw_data": data,
+                        "llm_response": llm_response,
+                    }
+                    if fetch_result.get("fallback_used"):
+                        tool_result["fallback_used"] = True
+                    log.append("   ✅ Answer drafted — delivering response below")
+            except Exception as e:
+                tool_result = {
+                    "success": False,
+                    "error": str(e),
+                    "llm_response": f"I encountered an error: {str(e)}",
+                    "tool_used": fetch_result.get("tool_used", selected_tool),
+                }
+                log.append(f"   ❌ Answer generation error: {str(e)}")
             
             # Done: add assistant message, clear state
             response_text = tool_result.get("llm_response", "I couldn't process that request. Please try again.")

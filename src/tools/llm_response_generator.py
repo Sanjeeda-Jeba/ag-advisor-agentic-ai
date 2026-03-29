@@ -1,6 +1,7 @@
 """
 LLM Response Generator
-Converts tool execution results into natural language responses using OpenAI
+Converts tool execution results into natural language responses using any configured LLM
+(OpenAI, Anthropic Claude, Google Gemini)
 """
 
 import os
@@ -11,34 +12,65 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-import openai
-from typing import Dict, Any
-from src.config.credentials import CredentialsManager
+from typing import Dict, Any, List
+from src.llm.factory import get_llm_client
+from src.config.llm_settings import is_llm_response_enabled
+
+
+def _parse_cdms_max_output_tokens() -> int:
+    """
+    Max completion tokens for CDMS label answers (RAG + Tavily paths).
+    Override with LLM_MAX_OUTPUT_TOKENS_CDMS (e.g. 4096 for long comparisons).
+    """
+    raw = os.getenv("LLM_MAX_OUTPUT_TOKENS_CDMS", "4096")
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        n = 4096
+    # Keep within sensible bounds for typical chat models
+    return max(512, min(n, 32768))
 
 
 class LLMResponseGenerator:
     """
     Generates natural language responses from tool results using LLM
-    
+
     This is the FINAL step in the pipeline:
     User Question → Tool Selection → Tool Execution → LLM Response → User
+
+    Uses provider-agnostic LLM layer. Configure via env vars:
+        LLM_PROVIDER: openai | anthropic | google
+        LLM_MODEL: model name (e.g., gpt-4o, claude-sonnet-4-6, gemini-2.0-flash)
+        LLM_MAX_OUTPUT_TOKENS_CDMS: max completion tokens for CDMS answers (default 4096)
+        LLM_ENABLED / LLM_RESPONSE_ENABLED: disable LLM and show raw tool output (see src/config/llm_settings.py)
     """
-    
-    def __init__(self, api_key: str = None, model: str = None):
+
+    def __init__(self, provider: str = None, model: str = None, api_key: str = None):
         """
         Initialize LLM Response Generator
-        
+
         Args:
-            api_key: OpenAI API key (optional, loads from .env if not provided)
-            model: OpenAI model to use (default: value from OPENAI_MODEL_NAME or gpt-4o-mini)
+            provider: LLM provider (openai, anthropic, google). Default: LLM_PROVIDER env or openai
+            model: Model name. Default: LLM_MODEL or OPENAI_MODEL_NAME env or gpt-4o-mini
+            api_key: API key for the provider (optional, loads from env if not provided)
         """
-        # Get API key
-        if api_key is None:
-            creds = CredentialsManager()
-            api_key = creds.get_api_key("openai")
-        
-        self.client = openai.OpenAI(api_key=api_key)
-        self.model = model or os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+        self._llm = None
+        self._provider = provider
+        self._model = model
+        self._api_key = api_key
+        self.cdms_max_output_tokens = _parse_cdms_max_output_tokens()
+
+    @property
+    def llm(self):
+        """Lazy LLM client — not created when only deterministic responses are used."""
+        if self._llm is None:
+            self._llm = get_llm_client(
+                provider=self._provider,
+                model=self._model,
+                api_key=self._api_key,
+                purpose="response_generation",
+            )
+        return self._llm
     
     def generate_response(
         self,
@@ -74,6 +106,11 @@ class LLMResponseGenerator:
             >>> print(response)
             "The weather in London is currently 15°C with partly cloudy skies..."
         """
+        if not is_llm_response_enabled():
+            return self._format_deterministic_response(
+                user_question, tool_name, tool_result, conversation_context
+            )
+
         # Route to appropriate formatter (pass context)
         if tool_name == "weather":
             return self._generate_weather_response(user_question, tool_result, conversation_context)
@@ -88,6 +125,163 @@ class LLMResponseGenerator:
             return self._generate_agriculture_web_response(user_question, tool_result, conversation_context)
         else:
             return self._generate_generic_response(user_question, tool_result, conversation_context)
+
+    def _format_deterministic_response(
+        self,
+        user_question: str,
+        tool_name: str,
+        tool_result: Dict[str, Any],
+        conversation_context: list = None,
+    ) -> str:
+        """
+        When LLM is disabled: return readable markdown from tool payloads (no API calls).
+        """
+        header = (
+            "**LLM response formatting is off** "
+            "(`LLM_ENABLED=false` or `LLM_RESPONSE_ENABLED=false`). "
+            "Structured tool output:\n\n---\n\n"
+        )
+
+        if tool_name == "weather":
+            return header + self._format_deterministic_weather(user_question, tool_result)
+        if tool_name == "soil":
+            return header + self._format_deterministic_soil(user_question, tool_result)
+        if tool_name in (
+            "rag",
+            "documentation",
+            "cdms_label",
+            "cdms",
+            "pesticide_label",
+        ):
+            data = tool_result or {}
+            rag_chunks = data.get("rag_chunks", [])
+            if data.get("searched_index_only") and not rag_chunks:
+                return header + self._generate_cdms_index_only_no_match_response(
+                    user_question, data
+                )
+            return header + self._format_deterministic_cdms(user_question, data)
+        if tool_name in ("agriculture_web", "ag_web"):
+            return header + self._format_deterministic_ag_web(user_question, tool_result)
+        return header + self._format_deterministic_generic(user_question, tool_result)
+
+    def _format_deterministic_weather(self, user_question: str, data: Dict[str, Any]) -> str:
+        return (
+            f"**Your question:** {user_question}\n\n"
+            f"**Location:** {data.get('city', 'Unknown')}, {data.get('country', '')}\n"
+            f"- **Temperature:** {data.get('temperature', 'N/A')} °C\n"
+            f"- **Feels like:** {data.get('feels_like', 'N/A')} °C\n"
+            f"- **Conditions:** {data.get('description', 'N/A')}\n"
+            f"- **Humidity:** {data.get('humidity', 'N/A')} %\n"
+            f"- **Wind:** {data.get('wind_speed', 'N/A')} m/s\n"
+        )
+
+    def _format_deterministic_soil(self, user_question: str, data: Dict[str, Any]) -> str:
+        lines = [f"**Your question:** {user_question}\n"]
+        loc = data.get("location") or {}
+        lines.append(
+            f"**Location:** ({loc.get('lat', 'N/A')}, {loc.get('lon', 'N/A')})\n"
+        )
+        props = data.get("properties") or {}
+        if not props:
+            lines.append("\n*(No soil properties in result.)*")
+            return "\n".join(lines)
+        lines.append("\n**Soil properties:**\n")
+        for name, p in props.items():
+            if isinstance(p, dict):
+                label = p.get("label", name)
+                val = p.get("value", "N/A")
+                unit = p.get("unit", "")
+                lines.append(f"- **{label}:** {val} {unit}".strip())
+            else:
+                lines.append(f"- **{name}:** {p}")
+        return "\n".join(lines)
+
+    def _format_deterministic_cdms(self, user_question: str, data: Dict[str, Any]) -> str:
+        product = data.get("product_name", "Unknown product")
+        lines = [
+            f"**Your question:** {user_question}\n",
+            f"**Product:** {product}\n",
+            f"**Chunks retrieved:** {data.get('total_chunks_found', 0)}\n",
+        ]
+        summary = data.get("summary")
+        if summary:
+            lines.append(f"\n**Search summary:**\n{summary}\n")
+
+        rag_chunks: List[Dict[str, Any]] = data.get("rag_chunks") or []
+        if rag_chunks:
+            lines.append("\n**Label excerpts (from index):**\n")
+            for i, ch in enumerate(rag_chunks[:12], 1):
+                page = ch.get("page_number", "?")
+                title = ch.get("source_file", "document")
+                url = ch.get("pdf_url", "")
+                body = (ch.get("content") or "")[:900]
+                cite = f"Page {page} — {title}"
+                if url:
+                    cite += f" — [{url}]({url})"
+                lines.append(f"\n*{i}. {cite}*\n{body}")
+                if len(body) >= 900:
+                    lines.append("…")
+
+        labels = data.get("tavily_labels") or data.get("labels") or []
+        if labels:
+            lines.append("\n**Labels / links:**\n")
+            for lab in labels[:15]:
+                t = lab.get("title", "Label")
+                u = lab.get("url", "")
+                if u:
+                    lines.append(f"- [{t}]({u})")
+                else:
+                    lines.append(f"- {t}")
+
+        pdf_urls = data.get("pdf_urls") or []
+        if pdf_urls:
+            lines.append("\n**PDF URLs:**\n")
+            for u in pdf_urls:
+                lines.append(f"- [{u}]({u})")
+
+        if not rag_chunks and not labels and not pdf_urls:
+            lines.append(
+                "\n*(No indexed excerpts or label links in this result. "
+                "Check tool logs or enable LLM for a natural-language summary.)*"
+            )
+        return "\n".join(lines)
+
+    def _format_deterministic_ag_web(self, user_question: str, data: Dict[str, Any]) -> str:
+        lines = [
+            f"**Your question:** {user_question}\n",
+            f"**Query used:** {data.get('query', user_question)}\n\n",
+        ]
+        ans = data.get("answer") or data.get("summary")
+        if ans:
+            lines.append(f"**Tavily answer:**\n{ans}\n\n")
+        sources = data.get("sources") or []
+        if sources:
+            lines.append("**Sources:**\n")
+            for s in sources[:12]:
+                title = s.get("title", "Source")
+                url = s.get("url", "")
+                snip = (s.get("snippet") or "")[:300]
+                if url:
+                    lines.append(f"- [{title}]({url})")
+                else:
+                    lines.append(f"- {title}")
+                if snip:
+                    lines.append(f"  _{snip}…_" if len(snip) >= 300 else f"  _{snip}_")
+        citations = data.get("citations")
+        if citations:
+            lines.append(f"\n**Citations:**\n{citations}\n")
+        if not ans and not sources:
+            lines.append("*(No answer text or sources in tool result.)*")
+        return "\n".join(lines)
+
+    def _format_deterministic_generic(self, user_question: str, data: Dict[str, Any]) -> str:
+        import json
+
+        try:
+            blob = json.dumps(data, indent=2, default=str)[:6000]
+        except Exception:
+            blob = str(data)[:6000]
+        return f"**Your question:** {user_question}\n\n```json\n{blob}\n```\n"
     
     def _generate_weather_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """Generate natural language response for weather data
@@ -124,9 +318,7 @@ Requirements:
 
 Generate the response:"""
         
-        # Call OpenAI
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a helpful weather assistant that provides clear, friendly weather information."},
                 {"role": "user", "content": prompt}
@@ -134,8 +326,6 @@ Generate the response:"""
             temperature=0.7,
             max_tokens=200
         )
-        
-        return response.choices[0].message.content.strip()
     
     def _generate_soil_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """Generate natural language response for soil data
@@ -175,9 +365,7 @@ Requirements:
 
 Generate the response:"""
         
-        # Call OpenAI
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a helpful agricultural advisor that explains soil data clearly."},
                 {"role": "user", "content": prompt}
@@ -185,8 +373,6 @@ Generate the response:"""
             temperature=0.7,
             max_tokens=250
         )
-        
-        return response.choices[0].message.content.strip()
     
     def _generate_rag_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """Generate natural language response for RAG results
@@ -239,9 +425,7 @@ IMPORTANT:
 
 Generate the response:"""
         
-        # Call OpenAI
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a helpful agricultural advisor. You answer questions about agriculture, pesticides, insecticides, and farming based on provided documentation."},
                 {"role": "user", "content": prompt}
@@ -249,8 +433,6 @@ Generate the response:"""
             temperature=0.7,
             max_tokens=300
         )
-        
-        return response.choices[0].message.content.strip()
     
     def _generate_cdms_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """
@@ -260,6 +442,8 @@ Generate the response:"""
         """
         # Check if this is the new RAG pipeline format
         rag_chunks = data.get('rag_chunks', [])
+        if data.get("searched_index_only") and not rag_chunks:
+            return self._generate_cdms_index_only_no_match_response(user_question, data)
         
         if rag_chunks:
             # New RAG pipeline format - use page citations
@@ -267,6 +451,44 @@ Generate the response:"""
         else:
             # Old format - Tavily-only search
             return self._generate_cdms_tavily_response(user_question, data, conversation_context)
+
+    def _generate_cdms_index_only_no_match_response(self, user_question: str, data: Dict) -> str:
+        """Deterministic response when a same-product follow-up finds nothing in indexed PDFs."""
+        product_name = data.get("product_name", "this product")
+        labels = data.get("labels", [])
+        download_info = data.get("download_info", {})
+        pdf_urls = list(data.get("pdf_urls", []))
+
+        url_to_title = {}
+        for label in labels:
+            url = label.get("url", "")
+            title = label.get("title", "")
+            if url and title:
+                url_to_title[url] = title
+
+        for pdf_info in download_info.get("downloaded_pdfs", []):
+            url = pdf_info.get("url", "")
+            filename = pdf_info.get("filename", "")
+            if url and url not in url_to_title:
+                url_to_title[url] = filename.replace(".pdf", "").replace("_", " ").title()
+            if url and url not in pdf_urls:
+                pdf_urls.append(url)
+
+        if pdf_urls:
+            links = "\n".join(
+                f"- [{url_to_title.get(url, 'Label PDF')}]({url})"
+                for url in pdf_urls
+            )
+            return (
+                f"I searched the indexed **{product_name}** label PDFs for your follow-up question, "
+                f"but I could not find explicit information about that in the retrieved excerpts.\n\n"
+                f"**📄 PDF Downloads:**\n{links}"
+            )
+
+        return (
+            f"I searched the indexed **{product_name}** label PDFs for your follow-up question, "
+            f"but I could not find explicit information about that in the retrieved excerpts."
+        )
     
     def _generate_cdms_rag_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """
@@ -559,18 +781,15 @@ All information is from official pesticide label databases (CDMS, Greenbook, EPA
 IMPORTANT: Always end your response with the "📄 PDF Downloads" section containing ALL the PDF URLs provided in the context."
 """
         
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}
             ],
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=self.cdms_max_output_tokens
         )
-        
-        return response.choices[0].message.content.strip()
-    
+
     def _generate_cdms_tavily_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """
         Generate response from Tavily-only search (old format, fallback)
@@ -660,18 +879,15 @@ FORMAT when NO labels are found:
 Be conversational, helpful, and emphasize safety. Only state facts from the provided data."
 """
         
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}
             ],
             temperature=0.7,
-            max_tokens=800
+            max_tokens=self.cdms_max_output_tokens
         )
-        
-        return response.choices[0].message.content.strip()
-    
+
     def _generate_agriculture_web_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """
         Generate natural language response for agriculture web search results
@@ -743,8 +959,7 @@ Format your response like this:
 Be conversational, practical, and farmer-focused. Translate research into actionable advice. Use the Tavily AI answer as your primary source, then supplement with details from the sources."
 """
         
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}
@@ -752,9 +967,7 @@ Be conversational, practical, and farmer-focused. Translate research into action
             temperature=0.7,
             max_tokens=800
         )
-        
-        return response.choices[0].message.content.strip()
-    
+
     def _generate_generic_response(self, user_question: str, data: Dict, conversation_context: list = None) -> str:
         """Generate generic response for unknown tool types"""
         
@@ -764,8 +977,7 @@ Tool returned this data: {data}
 
 Generate a helpful, natural language response based on this information. Keep it concise and conversational (2-3 sentences)."""
         
-        response = self.client.chat.completions.create(
-            model=self.model,
+        return self.llm.chat(
             messages=[
                 {"role": "system", "content": "You are a helpful AI assistant."},
                 {"role": "user", "content": prompt}
@@ -773,8 +985,6 @@ Generate a helpful, natural language response based on this information. Keep it
             temperature=0.7,
             max_tokens=200
         )
-        
-        return response.choices[0].message.content.strip()
 
 
 # Test function
@@ -814,7 +1024,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Error: {e}")
         print("\n💡 Make sure:")
-        print("   1. You have OPENAI_API_KEY in your .env file")
-        print("   2. The API key is valid and active")
+        print("   1. You have LLM_PROVIDER and LLM_MODEL set in .env (or use defaults)")
+        print("   2. You have the appropriate API key (OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY)")
         print("   3. You have internet connection")
 

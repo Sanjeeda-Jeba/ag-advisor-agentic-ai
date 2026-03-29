@@ -37,7 +37,9 @@ class CredentialsManager:
         self.api_key_map = {
             "openweather": "OPENWEATHER_API_KEY",
             "openai": "OPENAI_API_KEY",
-            "tavily": "TAVILY_API_KEY"
+            "tavily": "TAVILY_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "google": "GOOGLE_API_KEY",  # GOOGLE_API_KEY or GEMINI_API_KEY
         }
     
     def get_api_key(self, api_name: str) -> str:

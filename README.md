@@ -124,16 +124,28 @@ python -m spacy download en_core_web_sm
 ### 4. Set Up Environment Variables
 
 ```bash
-cp env_template.txt .env
+cp .env.example .env
 ```
 
-Edit `.env` and add your API keys:
+Edit `.env` and add your API keys. **LLM Provider** (switch anytime via env vars):
 
 ```env
+# LLM: Switch providers without code changes
+LLM_PROVIDER=openai          # openai | anthropic | google
+LLM_MODEL=gpt-4o-mini        # e.g., gpt-4o, claude-sonnet-4-6, gemini-2.0-flash
+# LLM_MAX_OUTPUT_TOKENS_CDMS=4096   # optional: longer CDMS label answers (default 4096)
+# LLM_ENABLED=true                  # false = disable LLM intent + phrasing (keyword routing + raw tool output)
+# LLM_INTENT_ENABLED=true           # optional: override intent LLM when LLM_ENABLED=true
+# LLM_RESPONSE_ENABLED=true         # optional: override answer phrasing LLM
+# LLM_SILENT_CLIENT_LOADS=true      # optional: hide "[LLM] Loaded client: ..." startup lines
+
+# API keys (only the one for LLM_PROVIDER is required)
 OPENAI_API_KEY=your_openai_api_key_here
+ANTHROPIC_API_KEY=your_anthropic_api_key_here   # when using Claude
+GOOGLE_API_KEY=your_google_api_key_here         # when using Gemini
+
 TAVILY_API_KEY=your_tavily_api_key_here
 OPENWEATHER_API_KEY=your_openweather_api_key_here
-OPENAI_MODEL_NAME=gpt-4o-mini  # Optional, defaults to gpt-4o-mini
 ```
 
 ### 5. Start Qdrant Vector Database

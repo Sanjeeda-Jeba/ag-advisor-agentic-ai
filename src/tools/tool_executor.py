@@ -10,10 +10,16 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from typing import Dict
+from typing import Dict, Optional
+import inspect
+
 from src.tools.weather_tool import execute_weather_tool
 from src.tools.llm_response_generator import LLMResponseGenerator
 # Soil tool imported lazily in __init__ to avoid circular dependencies
+
+_CDMS_TOOL_NAMES = frozenset(
+    {"cdms_label", "cdms", "pesticide_label", "rag", "documentation"}
+)
 
 
 class ToolExecutor:
@@ -46,7 +52,123 @@ class ToolExecutor:
             "agriculture_web": execute_agriculture_web_tool,
             "ag_web": execute_agriculture_web_tool,  # Alias
         }
-    
+
+    def _invoke_tool(
+        self,
+        tool_name: str,
+        user_question: str,
+        conversation_context: Optional[list],
+    ) -> Dict:
+        """Call the registered tool function with optional conversation_context."""
+        tool_function = self.tools[tool_name]
+        sig = inspect.signature(tool_function)
+        if "conversation_context" in sig.parameters:
+            return tool_function(
+                user_question, conversation_context=conversation_context or []
+            )
+        return tool_function(user_question)
+
+    def fetch_tool_data(
+        self,
+        tool_name: str,
+        user_question: str,
+        conversation_context: Optional[list] = None,
+    ) -> Dict:
+        """
+        Run tool pipeline only (no LLM). Used by the UI to show a distinct
+        "gathering data" phase before answer synthesis.
+        """
+        conversation_context = conversation_context or []
+        if tool_name not in self.tools:
+            return {
+                "success": False,
+                "tool_used": tool_name,
+                "error": f"Unknown tool: {tool_name}",
+                "fallback_used": False,
+            }
+
+        try:
+            tool_result = self._invoke_tool(
+                tool_name, user_question, conversation_context
+            )
+            effective_tool = tool_name
+
+            if tool_name in _CDMS_TOOL_NAMES:
+                cdms_data = tool_result.get("data", {})
+                total_chunks = cdms_data.get("total_chunks_found", 0)
+                should_fallback = tool_result.get("should_fallback", False)
+
+                print("🔍 CDMS Tool Result Debug:")
+                print(f"   success: {tool_result.get('success')}")
+                print(f"   total_chunks: {total_chunks}")
+                print(f"   should_fallback: {should_fallback}")
+                _chunks = cdms_data.get("rag_chunks") or []
+                print(f"   has_rag_chunks: {len(_chunks)}")
+
+                if should_fallback:
+                    print(
+                        "⚠️  CDMS explicitly requested fallback, trying agriculture_web..."
+                    )
+                    fb = self._fetch_agriculture_web_data_only(
+                        user_question, conversation_context
+                    )
+                    if fb.get("success"):
+                        print("✅ Fallback to agriculture_web (data fetch) successful")
+                        return {
+                            "success": True,
+                            "tool_used": "agriculture_web",
+                            "data": fb.get("data", {}),
+                            "fallback_used": True,
+                            "raw_tool_result": fb,
+                        }
+                    print(
+                        "⚠️  Fallback to agriculture_web failed, continuing with CDMS"
+                    )
+                elif total_chunks == 0:
+                    print(
+                        "ℹ️  CDMS found 0 chunks, but continuing (may be processing PDFs or have Tavily results)"
+                    )
+
+            if not tool_result.get("success"):
+                return {
+                    "success": False,
+                    "tool_used": effective_tool,
+                    "error": tool_result.get("error", "Tool execution failed"),
+                    "raw_data": tool_result,
+                    "fallback_used": False,
+                }
+
+            return {
+                "success": True,
+                "tool_used": effective_tool,
+                "data": tool_result.get("data", {}),
+                "fallback_used": False,
+                "raw_tool_result": tool_result,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "tool_used": tool_name,
+                "error": f"Execution error: {str(e)}",
+                "fallback_used": False,
+            }
+
+    def compose_llm_response(
+        self,
+        user_question: str,
+        tool_used: str,
+        tool_data: Dict,
+        conversation_context: Optional[list] = None,
+    ) -> str:
+        """Turn structured tool output into the assistant reply (LLM call)."""
+        return self.llm_generator.generate_response(
+            user_question=user_question,
+            tool_name=tool_used,
+            tool_result=tool_data,
+            conversation_context=conversation_context or [],
+        )
+
     def execute(self, tool_name: str, user_question: str, conversation_context: list = None) -> Dict:
         """
         Execute a tool and generate LLM response
@@ -67,94 +189,62 @@ class ToolExecutor:
                 "error": "error message if failed"
             }
         """
-        # Check if tool exists
-        if tool_name not in self.tools:
-            return {
-                "success": False,
-                "tool_used": tool_name,
-                "error": f"Unknown tool: {tool_name}"
-            }
-        
         try:
-            # Step 1: Execute the tool (pass context if tool supports it)
-            tool_function = self.tools[tool_name]
-            
-            # Check if tool function accepts context parameter
-            import inspect
-            sig = inspect.signature(tool_function)
-            if 'conversation_context' in sig.parameters:
-                tool_result = tool_function(user_question, conversation_context=conversation_context)
-            else:
-                tool_result = tool_function(user_question)
-            
-            # Special handling: If CDMS fails or finds no results, try agriculture_web as fallback
-            if tool_name in ["cdms_label", "cdms", "pesticide_label", "rag", "documentation"]:
-                cdms_data = tool_result.get("data", {})
-                rag_chunks = cdms_data.get("rag_chunks", [])
-                total_chunks = cdms_data.get("total_chunks_found", 0)
-                should_fallback = tool_result.get("should_fallback", False)
-                
-                # Debug logging
-                print(f"🔍 CDMS Tool Result Debug:")
-                print(f"   success: {tool_result.get('success')}")
-                print(f"   total_chunks: {total_chunks}")
-                print(f"   should_fallback: {should_fallback}")
-                print(f"   has_rag_chunks: {len(rag_chunks) if rag_chunks else 0}")
-                
-                # PHASE 2 FIX: Only fallback if explicitly requested
-                # Don't fallback just because no chunks were found - CDMS might still have Tavily results
-                # or be processing new PDFs. Only fallback if explicitly requested.
-                
-                if should_fallback:
-                    # Explicitly requested fallback - try agriculture_web
-                    print(f"⚠️  CDMS explicitly requested fallback, trying agriculture_web...")
-                    fallback_result = self._try_agriculture_web_fallback(
-                        user_question, conversation_context
-                    )
-                    if fallback_result.get("success"):
-                        print(f"✅ Fallback to agriculture_web successful")
-                        return fallback_result
-                    else:
-                        print(f"⚠️  Fallback to agriculture_web failed, continuing with CDMS")
-                    # If fallback also fails, continue with CDMS error
-                else:
-                    # No explicit fallback requested - continue with CDMS even if no chunks
-                    # CDMS might be downloading/processing PDFs, or Tavily results might be available
-                    if total_chunks == 0:
-                        print(f"ℹ️  CDMS found 0 chunks, but continuing (may be processing PDFs or have Tavily results)")
-            
-            # Check if tool execution was successful
-            if not tool_result.get("success"):
+            fetched = self.fetch_tool_data(
+                tool_name, user_question, conversation_context
+            )
+            if not fetched.get("success"):
                 return {
                     "success": False,
-                    "tool_used": tool_name,
-                    "error": tool_result.get("error", "Tool execution failed"),
-                    "raw_data": tool_result
+                    "tool_used": fetched.get("tool_used", tool_name),
+                    "error": fetched.get("error", "Tool execution failed"),
+                    "raw_data": fetched.get("raw_data"),
                 }
-            
-            # Step 2: Generate LLM response from tool result (with context)
-            llm_response = self.llm_generator.generate_response(
-                user_question=user_question,
-                tool_name=tool_name,
-                tool_result=tool_result.get("data", {}),
-                conversation_context=conversation_context
-            )
-            
-            # Step 3: Return complete result
-            return {
+
+            used = fetched["tool_used"]
+            data = fetched.get("data", {})
+            try:
+                llm_response = self.compose_llm_response(
+                    user_question, used, data, conversation_context
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    "tool_used": used,
+                    "error": str(e),
+                    "raw_data": data,
+                }
+
+            out = {
                 "success": True,
-                "tool_used": tool_name,
-                "raw_data": tool_result.get("data", {}),
-                "llm_response": llm_response
+                "tool_used": used,
+                "raw_data": data,
+                "llm_response": llm_response,
             }
-        
+            if fetched.get("fallback_used"):
+                out["fallback_used"] = True
+            return out
+
         except Exception as e:
             return {
                 "success": False,
                 "tool_used": tool_name,
-                "error": f"Execution error: {str(e)}"
+                "error": f"Execution error: {str(e)}",
             }
-    
+
+    def _fetch_agriculture_web_data_only(
+        self, user_question: str, conversation_context: Optional[list] = None
+    ) -> Dict:
+        """Run agriculture_web tool without LLM (for phased UI / fetch_tool_data)."""
+        from src.tools.agriculture_web_tool import execute_agriculture_web_tool
+
+        try:
+            return execute_agriculture_web_tool(
+                user_question, conversation_context=conversation_context or []
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e), "data": {}}
+
     def _try_agriculture_web_fallback(self, user_question: str, conversation_context: list = None) -> Dict:
         """
         Fallback to agriculture_web tool when CDMS finds no results
@@ -167,38 +257,35 @@ class ToolExecutor:
             Dict with tool result or failure
         """
         try:
-            from src.tools.agriculture_web_tool import execute_agriculture_web_tool
-            
-            # Try agriculture_web tool (with context for follow-ups)
-            tool_result = execute_agriculture_web_tool(user_question, conversation_context=conversation_context)
-            
+            tool_result = self._fetch_agriculture_web_data_only(
+                user_question, conversation_context
+            )
+
             if tool_result.get("success"):
-                # Generate LLM response
-                llm_response = self.llm_generator.generate_response(
+                llm_response = self.compose_llm_response(
                     user_question=user_question,
-                    tool_name="agriculture_web",
-                    tool_result=tool_result.get("data", {}),
-                    conversation_context=conversation_context
+                    tool_used="agriculture_web",
+                    tool_data=tool_result.get("data", {}),
+                    conversation_context=conversation_context,
                 )
-                
+
                 return {
                     "success": True,
                     "tool_used": "agriculture_web",
                     "raw_data": tool_result.get("data", {}),
                     "llm_response": llm_response,
-                    "fallback_used": True  # Indicate this was a fallback
+                    "fallback_used": True,
                 }
-            else:
-                return {
-                    "success": False,
-                    "tool_used": "agriculture_web",
-                    "error": tool_result.get("error", "Agriculture web search failed")
-                }
+            return {
+                "success": False,
+                "tool_used": "agriculture_web",
+                "error": tool_result.get("error", "Agriculture web search failed"),
+            }
         except Exception as e:
             return {
                 "success": False,
                 "tool_used": "agriculture_web",
-                "error": f"Fallback error: {str(e)}"
+                "error": f"Fallback error: {str(e)}",
             }
 
 

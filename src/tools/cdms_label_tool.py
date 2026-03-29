@@ -12,6 +12,7 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.api_clients.tavily_client import TavilyAPIClient
+from src.cdms.cdms_direct_search import try_direct_cdms_search
 from src.cdms.pdf_downloader import CDMSPDFDownloader
 from src.cdms.rag_search import CDMSRAGSearch
 from src.cdms.document_loader import DocumentLoader
@@ -21,9 +22,9 @@ from src.rag.vector_store import QdrantVectorStore
 class CDMSLabelTool:
     """
     Tool for searching CDMS pesticide labels
-    
-    Uses Tavily with domain filtering (cdms.net) to find accurate label information
-    with full citations and source URLs.
+
+    Tries direct cdms.net HTML link discovery first (optional), then falls back to
+    Tavily with domain filtering and the existing multi-source label chain.
     
     Creates a single shared QdrantVectorStore and passes it to both
     DocumentLoader (writes) and CDMSRAGSearch (reads) so they always
@@ -52,15 +53,17 @@ class CDMSLabelTool:
         self,
         product_name: str,
         active_ingredient: Optional[str] = None,
-        max_results: int = 5
+        max_results: int = 5,
+        user_question: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Search for CDMS pesticide labels
         
         Args:
-            product_name: Product or brand name (e.g., "Roundup", "Sevin")
+            product_name: Product or brand name extracted from the user query (e.g. "Roundup")
             active_ingredient: Optional active ingredient (e.g., "glyphosate")
             max_results: Maximum number of label results to return (1-5)
+            user_question: Original user question; passed to direct CDMS fetch for URL seeds
         
         Returns:
             Dict with:
@@ -76,12 +79,26 @@ class CDMSLabelTool:
                 - label_count: int
                 - citations: str (formatted citation text)
         """
-        # Perform search via Tavily client
-        raw_results = self.client.search_cdms_labels(
+        direct = try_direct_cdms_search(
             product_name=product_name,
             active_ingredient=active_ingredient,
-            max_results=max_results
+            max_results=max_results,
+            user_question=user_question,
         )
+        if direct is not None:
+            src = direct.get("source", "CDMS (direct)")
+            print(
+                f"✅ CDMS discovery ({src}): {direct.get('result_count', 0)} PDF link(s) "
+                f"for label/product '{product_name}' — skipping Tavily for discovery"
+            )
+            raw_results = direct
+        else:
+            print(f"ℹ️  CDMS direct fetch: no PDF links — using Tavily label chain")
+            raw_results = self.client.search_cdms_labels(
+                product_name=product_name,
+                active_ingredient=active_ingredient,
+                max_results=max_results,
+            )
         
         if not raw_results.get("success"):
             return {
@@ -320,15 +337,17 @@ class CDMSLabelTool:
         self,
         product_name: str,
         user_question: str,
-        active_ingredient: Optional[str] = None
+        active_ingredient: Optional[str] = None,
+        cdms_seed_question: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Full RAG pipeline: Tavily → Download → Process → Index → RAG Search
         
         Args:
             product_name: Product name (e.g., "Roundup")
-            user_question: User's question (e.g., "What's the application rate?")
+            user_question: User's question (often enhanced for RAG recall)
             active_ingredient: Optional active ingredient
+            cdms_seed_question: Original user text for direct CDMS HTML seeds (defaults to user_question)
         
         Returns:
             Dict with:
@@ -344,7 +363,8 @@ class CDMSLabelTool:
         tavily_result = self.search(
             product_name=product_name,
             active_ingredient=active_ingredient,
-            max_results=3
+            max_results=3,
+            user_question=cdms_seed_question or user_question,
         )
         
         if not tavily_result.get("success"):
@@ -813,6 +833,9 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
             if context_product and (not product_name or product_name == "pesticide"):
                 product_name = context_product
         
+        # Strip trailing punctuation often copied from questions (e.g. "hydrovant-fa?")
+        product_name = product_name.strip().rstrip("?!.,;:\"')]}>")
+        
         # Build enhanced question (append product + type for better RAG recall)
         if product_name and product_name != "pesticide":
             if detected_type:
@@ -829,7 +852,8 @@ def execute_cdms_label_tool(question: str, conversation_context: list = None) ->
         result = tool.search_with_rag(
             product_name=product_name,
             user_question=enhanced_question,
-            active_ingredient=active_ingredient
+            active_ingredient=active_ingredient,
+            cdms_seed_question=question_clean,
         )
         
         if not result.get("success"):

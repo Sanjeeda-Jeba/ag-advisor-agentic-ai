@@ -1,6 +1,7 @@
 """
 LLM Intent Classifier
 Uses LLM to classify user intent and select appropriate tool
+Supports OpenAI, Anthropic Claude, and Google Gemini via provider-agnostic layer
 """
 
 import sys
@@ -8,33 +9,40 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-import openai
 import json
 import hashlib
-from typing import Dict, List, Optional
-from src.config.credentials import CredentialsManager
 import os
+from typing import Dict, List, Optional
+
+from src.llm.factory import get_llm_client
 
 
 class LLMIntentClassifier:
     """
     Classifies user queries using LLM to determine intent and select tool
+
+    Uses provider-agnostic LLM layer. Configure via env vars:
+        LLM_PROVIDER: openai | anthropic | google
+        LLM_INTENT_MODEL: model for intent (default: gpt-4o-mini). Falls back to LLM_MODEL if not set.
+        LLM_MODEL: fallback model name
     """
-    
-    def __init__(self, api_key: str = None, model: str = None):
+
+    def __init__(self, provider: str = None, model: str = None, api_key: str = None):
         """
         Initialize LLM Intent Classifier
-        
+
         Args:
-            api_key: OpenAI API key (optional, loads from .env if not provided)
-            model: OpenAI model to use (default: gpt-4o-mini for cost efficiency)
+            provider: LLM provider (openai, anthropic, google). Default: LLM_PROVIDER env or openai
+            model: Model name. Default: LLM_INTENT_MODEL or LLM_MODEL env or gpt-4o-mini
+            api_key: API key for the provider (optional)
         """
-        if api_key is None:
-            creds = CredentialsManager()
-            api_key = creds.get_api_key("openai")
-        
-        self.client = openai.OpenAI(api_key=api_key)
-        self.model = model or os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+        intent_model = model or os.getenv("LLM_INTENT_MODEL") or os.getenv("LLM_MODEL")
+        self.llm = get_llm_client(
+            provider=provider,
+            model=intent_model,
+            api_key=api_key,
+            purpose="intent_classification",
+        )
         self.cache = {}  # Simple in-memory cache (can be upgraded to Redis later)
         self.cache_size_limit = 1000  # Limit cache size
     
@@ -65,24 +73,18 @@ class LLMIntentClassifier:
         
         # Call LLM
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            # OpenAI supports response_format for JSON; other providers use prompt
+            response_text = self.llm.chat(
                 messages=[
-                    {
-                        "role": "system",
-                        "content": self._get_system_prompt()
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": self._get_system_prompt()},
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,  # Lower temperature for more consistent classification
                 max_tokens=200,
-                response_format={"type": "json_object"}  # Force JSON response
+                response_format={"type": "json_object"}  # OpenAI only; others ignore
             )
-            
-            result = json.loads(response.choices[0].message.content)
+
+            result = json.loads(response_text)
             
             # Validate and normalize result
             result = self._validate_result(result)

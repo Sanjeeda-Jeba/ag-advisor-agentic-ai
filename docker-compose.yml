@@ -15,9 +15,12 @@ services:
       QDRANT_HOST: qdrant
       QDRANT_PORT: "6333"
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY}
       OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY}
-      OPENAI_MODEL_NAME: ${OPENAI_MODEL_NAME}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
     volumes:
       - app_data:/app/data    # SQLite DB + cached PDFs + local Qdrant fallback
     depends_on:
